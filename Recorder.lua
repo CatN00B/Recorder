@@ -3,8 +3,27 @@ local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 
-local LP = Players.LocalPlayer
-while not LP do wait(0.1) LP = Players.LocalPlayer end
+local LP
+for i = 1, 100 do
+    local ok, p = pcall(function() return Players.LocalPlayer end)
+    if ok and p then LP = p break end
+    wait(0.1)
+end
+if not LP then
+    for i = 1, 100 do
+        local ok, p = pcall(function() return game.Players.LocalPlayer end)
+        if ok and p then LP = p break end
+        wait(0.1)
+    end
+end
+if not LP then
+    notify("LocalPlayer unavailable", "Recorder", 3)
+    return
+end
+for i = 1, 100 do
+    if game:IsLoaded() and workspace.CurrentCamera then break end
+    wait(0.1)
+end
 
 local S = { rec = false, play = false, loop_ = false }
 local pSpeed, rate = 1.0, 20
@@ -43,7 +62,42 @@ local trimHeadMapCircle, trimTailMapSquare = nil, nil
 local function c3(t) return Color3.fromRGB(t.r, t.g, t.b) end
 local function lerpCf(a, b, t) return a:Lerp(b, t) end
 
-local function hrp() local c = LP.Character return c and c:FindFirstChild("HumanoidRootPart") end
+local function catmullRomV3(a, b, c, d, t)
+    local t2 = t * t
+    local t3 = t2 * t
+    return Vector3.new(
+        0.5 * ((2 * b.X) + (-a.X + c.X) * t + (2 * a.X - 5 * b.X + 4 * c.X - d.X) * t2 + (-a.X + 3 * b.X - 3 * c.X + d.X) * t3),
+        0.5 * ((2 * b.Y) + (-a.Y + c.Y) * t + (2 * a.Y - 5 * b.Y + 4 * c.Y - d.Y) * t2 + (-a.Y + 3 * b.Y - 3 * c.Y + d.Y) * t3),
+        0.5 * ((2 * b.Z) + (-a.Z + c.Z) * t + (2 * a.Z - 5 * b.Z + 4 * c.Z - d.Z) * t2 + (-a.Z + 3 * b.Z - 3 * c.Z + d.Z) * t3)
+    )
+end
+
+local function splineCf(idx, alpha)
+    local n = #frames
+    if n < 4 then return nil end
+    local i0 = idx - 1
+    local i1 = idx
+    local i2 = idx + 1
+    local i3 = idx + 2
+    if i0 < 1 or i3 > n then return nil end
+
+    local f0, f1, f2, f3 = frames[i0], frames[i1], frames[i2], frames[i3]
+    local p0 = f0.cf.Position
+    local p1 = f1.cf.Position
+    local p2 = f2.cf.Position
+    local p3 = f3.cf.Position
+
+    local posSpline = catmullRomV3(p0, p1, p2, p3, alpha)
+
+    local rotInterp = f1.cf:Lerp(f2.cf, alpha)
+    local rx, ry, rz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = rotInterp:GetComponents()
+    return CFrame.new(posSpline.X, posSpline.Y, posSpline.Z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
+end
+
+local function hrp()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
 local function folder() if not isfolder(recFolder) then pcall(makefolder, recFolder) end end
 local function rpath(n) return recFolder .. "/" .. n .. ".json" end
 local function clearLines(t)
@@ -303,15 +357,50 @@ local function startPlay()
     return true
 end
 
-local function setRec(v) if S.rec == v then return end S.rec = v UI.SetValue("r_on", v) if v then startRec() else stopRec() end end
+local function resetTrimValues()
+    trimH, trimT, trimHS, trimTS = 0, 0, 0, 0
+    UI.SetValue("r_trim_h", 0)
+    UI.SetValue("r_trim_t", 0)
+    UI.SetValue("r_trim_hs", 0)
+    UI.SetValue("r_trim_ts", 0)
+end
+
+local function setRec(v)
+    if S.rec == v then return end
+    if v and S.play then
+        S.play = false
+        UI.SetValue("r_play_on", false)
+    end
+    S.rec = v
+    UI.SetValue("r_on", v)
+    if v then
+        resetTrimValues()
+        startRec()
+    else
+        stopRec()
+    end
+end
+
 local function setPlay(v)
     if S.play == v then return end
+    if v and S.rec then
+        S.rec = false
+        UI.SetValue("r_on", false)
+        stopRec()
+    end
     if v then
-        if not startPlay() then notify("Need 2+ frames", "Recorder", 2) return end
+        if not startPlay() then
+            notify("Need 2+ frames", "Recorder", 2)
+            UI.SetValue("r_play_on", false)
+            return
+        end
         S.play = true
-    else S.play = false end
+    else
+        S.play = false
+    end
     UI.SetValue("r_play_on", v)
 end
+
 local function setLoop(v) if S.loop_ == v then return end S.loop_ = v UI.SetValue("r_loop", v) end
 
 local function trimHead(n)
@@ -352,6 +441,20 @@ local function trimSecTail(sec)
     return r
 end
 
+local function applyTrim()
+    if #frames < 3 then
+        notify("Not enough frames", "Recorder", 2)
+        return
+    end
+    local n0 = #frames
+    if trimHS > 0 then trimSecHead(trimHS) end
+    if trimTS > 0 then trimSecTail(trimTS) end
+    if trimH > 0 and #frames > trimT + 1 then trimHead(trimH) end
+    if trimT > 0 and #frames > 1 then trimTail(trimT) end
+    resetTrimValues()
+    notify(string.format("Trim: %d -> %d", n0, #frames), "Recorder", 2)
+end
+
 local function save()
     folder()
     local out = { rate = rate, frames = {} }
@@ -376,7 +479,7 @@ local function load()
         if f.p and f.l then
             local pos = Vector3.new(f.p[1], f.p[2], f.p[3])
             local lv = Vector3.new(f.l[1], f.l[2], f.l[3])
-            local cf = lv.Magnitude > 0.001 and CFrame.lookAt(pos, pos + lv) or CFrame.new(pos)
+            local cf = lv.Magnitude > 0.001 and CFrame.lookAt(pos, pos + lv) or CFrame.new(pos.X, pos.Y, pos.Z)
             frames[i] = { t = f.t or 0, cf = cf }
         end
     end
@@ -389,7 +492,6 @@ local function saveCfg()
         pSpeed = pSpeed, rate = rate, file = file,
         showPath = showPath, showHud = showHud, showGraph = showGraph, showBar = showBar, showMap = showMap,
         mapSize = mapSize, mapX = mapX, mapY = mapY, hudX = hudX, hudY = hudY,
-        trimH = trimH, trimT = trimT, trimHS = trimHS, trimTS = trimTS,
         showTrimPreview = showTrimPreview,
         pathColor = pathColor, headColor = headColor, tailColor = tailColor, trimColor = trimColor,
     }
@@ -420,7 +522,6 @@ local function loadCfg()
     showGraph, showBar, showMap = b(d.showGraph, showGraph), b(d.showBar, showBar), b(d.showMap, showMap)
     mapSize, mapX, mapY = n(d.mapSize, mapSize), n(d.mapX, mapX), n(d.mapY, mapY)
     hudX, hudY = n(d.hudX, hudX), n(d.hudY, hudY)
-    trimH, trimT, trimHS, trimTS = n(d.trimH, trimH), n(d.trimT, trimT), n(d.trimHS, trimHS), n(d.trimTS, trimTS)
     showTrimPreview = b(d.showTrimPreview, showTrimPreview)
     pathColor = readColor(d.pathColor, pathColor)
     headColor = readColor(d.headColor, headColor)
@@ -435,7 +536,7 @@ local function syncUI()
         {"r_graph", showGraph}, {"r_bar", showBar}, {"r_hud_x", hudX}, {"r_hud_y", hudY},
         {"r_map", showMap}, {"r_map_size", mapSize}, {"r_map_x", mapX}, {"r_map_y", mapY},
         {"r_name", file}, {"r_trim_preview", showTrimPreview},
-        {"r_trim_h", trimH}, {"r_trim_t", trimT}, {"r_trim_hs", trimHS}, {"r_trim_ts", trimTS},
+        {"r_trim_h", 0}, {"r_trim_t", 0}, {"r_trim_hs", 0}, {"r_trim_ts", 0},
     }) do UI.SetValue(kv[1], kv[2]) end
     local idx = 0
     for i, nm in ipairs(fileList) do if nm == file then idx = i - 1 break end end
@@ -648,7 +749,9 @@ local function updateHud()
     local t5 = hudRows[5]
     t5.Position = Vector2.new(hudX + padX, hudY + padY + 20 + 4 * rowH)
     t5.Color = frameGaps > 0 and Color3.fromRGB(255, 180, 90) or Color3.fromRGB(150, 255, 190)
-    t5.Visible = true    local cy = hudY + padY + 20 + rowH * 5
+    t5.Visible = true
+
+    local cy = hudY + padY + 20 + rowH * 5
     if showGraph then
         local gx, gy, gw, gh = hudX + padX, cy, w - padX * 2, gH - 6
         graphBg.Position, graphBg.Size, graphBg.Visible = Vector2.new(gx, gy), Vector2.new(gw, gh), true
@@ -784,7 +887,7 @@ RunService.RenderStepped:Connect(function()
                 local a, b = frames[pIdx], frames[pIdx + 1]
                 local seg = b.t - a.t
                 local al = math.clamp(seg > 0 and (el - a.t) / seg or 0, 0, 1)
-                cf = a.cf:Lerp(b.cf, al)
+                cf = splineCf(pIdx, al) or a.cf:Lerp(b.cf, al)
             end
             if cf then h.CFrame = cf h.AssemblyLinearVelocity = Vector3.zero end
         end
@@ -805,7 +908,8 @@ UI.AddTab("Recorder", function(tab)
     s1:SliderInt("r_rate", "Sample Rate", 5, 60, rate, function(v) rate = v end)
     s1:SliderFloat("r_spd", "Playback Speed", 0.1, 5.0, pSpeed, "%.2f", function(v) pSpeed = v end)
     s1:Button("Clear", 100, 20, function()
-        setPlay(false) frames, mapBounds = {}, nil
+        setPlay(false)
+        frames, mapBounds = {}, nil
         clearPath() clearMap()
         lastCf, lastCfT = nil, 0
         frameGaps = 0
@@ -866,22 +970,14 @@ UI.AddTab("Recorder", function(tab)
     s4:ColorPicker("r_trim_col", trimColor.r/255, trimColor.g/255, trimColor.b/255, trimColor.a, function(c, a)
         trimColor.r, trimColor.g, trimColor.b, trimColor.a = math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5), a
     end)
-    s4:SliderInt("r_trim_h", "Trim Head (frames)", 0, 700, trimH, function(v) trimH = v end)
-    s4:SliderInt("r_trim_t", "Trim Tail (frames)", 0, 700, trimT, function(v) trimT = v end)
-    s4:SliderFloat("r_trim_hs", "Trim Head (sec)", 0, 30, trimHS, "%.2f", function(v) trimHS = v end)
-    s4:SliderFloat("r_trim_ts", "Trim Tail (sec)", 0, 30, trimTS, "%.2f", function(v) trimTS = v end)
-    s4:Button("Apply Trim", 120, 20, function()
-        if #frames < 3 then notify("Not enough frames", "Recorder", 2) return end
-        local n0 = #frames
-        if trimHS > 0 then trimSecHead(trimHS) end
-        if trimTS > 0 then trimSecTail(trimTS) end
-        if trimH > 0 and #frames > trimT + 1 then trimHead(trimH) end
-        if trimT > 0 and #frames > 1 then trimTail(trimT) end
-        notify(string.format("Trim: %d -> %d", n0, #frames), "Recorder", 2)
-    end)
+    s4:SliderInt("r_trim_h", "Trim Head (frames)", 0, 700, 0, function(v) trimH = v end)
+    s4:SliderInt("r_trim_t", "Trim Tail (frames)", 0, 700, 0, function(v) trimT = v end)
+    s4:SliderFloat("r_trim_hs", "Trim Head (sec)", 0, 30, 0, "%.2f", function(v) trimHS = v end)
+    s4:SliderFloat("r_trim_ts", "Trim Tail (sec)", 0, 30, 0, "%.2f", function(v) trimTS = v end)
+    s4:Button("Apply Trim", 120, 20, function() applyTrim() end)
     s4:Button("Reset Trim", 120, 20, function()
-        trimH, trimT, trimHS, trimTS = 0, 0, 0, 0
-        syncUI() notify("Trim reset", "Recorder", 2)
+        resetTrimValues()
+        notify("Trim reset", "Recorder", 2)
     end)
 
     local s5 = tab:Section("Minimap", "Right")
@@ -904,12 +1000,12 @@ UI.AddTab("Recorder", function(tab)
         showPath, showHud, showGraph, showBar, showMap = true, true, true, true, false
         mapSize, mapX, mapY = 180, 0, 0
         hudX, hudY = 20, 20
-        trimH, trimT, trimHS, trimTS = 0, 0, 0, 0
         showTrimPreview = true
         pathColor = {r = 120, g = 220, b = 180, a = 1}
         headColor = {r = 255, g = 60, b = 60, a = 1}
         tailColor = {r = 60, g = 180, b = 255, a = 1}
         trimColor = {r = 255, g = 140, b = 40, a = 0.9}
+        resetTrimValues()
         syncUI() notify("Config reset", "Recorder", 2)
     end)
     s6:Button("Delete Config", 120, 20, function()
