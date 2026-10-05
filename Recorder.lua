@@ -41,6 +41,8 @@ local trimColor = {r = 255, g = 140, b = 40, a = 0.9}
 
 local MAX_SEGS = 800
 local MIN_DIST = 0.1
+local MAX_FRAMES = 18000
+local VISUAL_THROTTLE = 2
 
 local frames, lines, mapSegs, graphSegs = {}, {}, {}, {}
 local t0, lastS, pT0, pIdx, drawnCount = 0, 0, 0, 1, 0
@@ -49,6 +51,9 @@ local mapBounds, fileCombo, fileList = nil, nil, {}
 
 local lastCf, lastCfT = nil, 0
 local frameGaps = 0
+local frameOverflow = false
+
+local visualTick = 0
 
 local hudBg, hudBorder, hudTitle, hudRows, cachedText = nil, nil, nil, {}, {}
 local graphBg, barBg, barFill, barText = nil, nil, nil, nil
@@ -339,6 +344,7 @@ local function startRec()
     t0, lastS = tick(), 0
     lastCf, lastCfT = nil, 0
     frameGaps = 0
+    frameOverflow = false
 end
 
 local function stopRec()
@@ -613,7 +619,6 @@ RunService.Heartbeat:Connect(function()
         lastCf, lastCfT = cfNow, now
         lastS = now
         table.insert(frames, { t = now - t0, cf = cfNow })
-        drawnCount = #frames
         return
     end
 
@@ -636,10 +641,10 @@ RunService.Heartbeat:Connect(function()
     lastCf, lastCfT = cfNow, now
     lastS = now
 
-    if #frames - drawnCount >= 3 then
-        for i = drawnCount + 1, #frames do addSeg(i, 1) end
-        drawnCount = #frames
-        if showMap then rebuildMap() end
+    if not frameOverflow and #frames >= MAX_FRAMES then
+        frameOverflow = true
+        notify(string.format("Frame limit reached (%d). Auto-stopped.", MAX_FRAMES), "Recorder", 4)
+        setRec(false)
     end
 end)
 
@@ -892,10 +897,15 @@ RunService.RenderStepped:Connect(function()
             if cf then h.CFrame = cf h.AssemblyLinearVelocity = Vector3.zero end
         end
     end
-    updatePath()
-    updateHud()
-    updateMap()
-    updateTrimPreview()
+
+    visualTick = visualTick + 1
+    if visualTick >= VISUAL_THROTTLE then
+        visualTick = 0
+        updatePath()
+        updateHud()
+        updateMap()
+        updateTrimPreview()
+    end
 end)
 
 folder() refreshList() local cfgOk = loadCfg()
