@@ -33,6 +33,7 @@ local mapSize, mapX, mapY = 180, 0, 0
 local hudX, hudY = 20, 20
 local trimH, trimT, trimHS, trimTS = 0, 0, 0, 0
 local showTrimPreview = true
+local heat, liveTrail, smoothTrail = false, false, true
 
 local pathColor = {r = 120, g = 220, b = 180, a = 1}
 local headColor = {r = 255, g = 60, b = 60, a = 1}
@@ -43,29 +44,59 @@ local MAX_SEGS = 800
 local MIN_DIST = 0.1
 local MAX_FRAMES = 18000
 local VISUAL_THROTTLE = 2
+local LIVE_BATCH = 4
+local HEAT_BANDS = 6
 
 local frames, lines, mapSegs, graphSegs = {}, {}, {}, {}
+local spd, spdS, stat = {}, {}, { dist = 0, maxV = 0, minV = math.huge }
 local t0, lastS, pT0, pIdx, drawnCount = 0, 0, 0, 1, 0
 local prevKeys = {}
 local mapBounds, fileCombo, fileList = nil, nil, {}
+local colorVer = 0
 
 local lastCf, lastCfT = nil, 0
 local frameGaps = 0
 local frameOverflow = false
-
 local visualTick = 0
 
 local hudBg, hudBorder, hudTitle, hudRows, cachedText = nil, nil, nil, {}, {}
 local graphBg, barBg, barFill, barText = nil, nil, nil, nil
 local barW, barH, graphMax, graphPts = 170, 6, 10, 60
 local mapBg, mapBorder, mapTitle, mapDotStart, mapDotCur, mapDotEnd = nil, nil, nil, nil, nil, nil
+local hudShown, hudLayoutKey, lastGraphKey, lastBarKey = false, nil, nil, nil
+local mapShown, lastMapKey = false, nil
+local trimShown, trimCV = false, -1
 
 local trimHeadSq, trimHeadX1, trimHeadX2 = nil, nil, nil
 local trimTailSq, trimTailX1, trimTailX2 = nil, nil, nil
 local trimHeadMapCircle, trimTailMapSquare = nil, nil
 
+local BANDS = {
+    {Color3.fromRGB(70, 140, 255)},
+    {Color3.fromRGB(70, 220, 230)},
+    {Color3.fromRGB(90, 255, 130)},
+    {Color3.fromRGB(230, 255, 80)},
+    {Color3.fromRGB(255, 170, 60)},
+    {Color3.fromRGB(255, 70, 70)},
+}
+
 local function c3(t) return Color3.fromRGB(t.r, t.g, t.b) end
 local function lerpCf(a, b, t) return a:Lerp(b, t) end
+
+local function heatCol(v)
+    local rng = stat.maxV - stat.minV
+    if rng <= 0 then rng = 1 end
+    local t = math.clamp((v - stat.minV) / rng, 0, 1)
+    if smoothTrail then
+        local idx = math.floor(t * (HEAT_BANDS - 1) + 0.5) + 1
+        return BANDS[idx][1]
+    end
+    local seg = 1 / (HEAT_BANDS - 1)
+    local idx = math.min(math.floor(t / seg) + 1, HEAT_BANDS - 1)
+    local lt = (t - (idx - 1) * seg) / seg
+    local c1, c2 = BANDS[idx][1], BANDS[idx + 1][1]
+    return Color3.new(c1.R + (c2.R - c1.R) * lt, c1.G + (c2.G - c1.G) * lt, c1.B + (c2.B - c1.B) * lt)
+end
 
 local function catmullRomV3(a, b, c, d, t)
     local t2 = t * t
@@ -80,21 +111,14 @@ end
 local function splineCf(idx, alpha)
     local n = #frames
     if n < 4 then return nil end
-    local i0 = idx - 1
-    local i1 = idx
-    local i2 = idx + 1
-    local i3 = idx + 2
+    local i0, i1, i2, i3 = idx - 1, idx, idx + 1, idx + 2
     if i0 < 1 or i3 > n then return nil end
-
-    local f0, f1, f2, f3 = frames[i0], frames[i1], frames[i2], frames[i3]
-    local p0 = f0.cf.Position
-    local p1 = f1.cf.Position
-    local p2 = f2.cf.Position
-    local p3 = f3.cf.Position
-
+    local p0 = frames[i0].cf.Position
+    local p1 = frames[i1].cf.Position
+    local p2 = frames[i2].cf.Position
+    local p3 = frames[i3].cf.Position
     local posSpline = catmullRomV3(p0, p1, p2, p3, alpha)
-
-    local rotInterp = f1.cf:Lerp(f2.cf, alpha)
+    local rotInterp = frames[i1].cf:Lerp(frames[i2].cf, alpha)
     local rx, ry, rz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = rotInterp:GetComponents()
     return CFrame.new(posSpline.X, posSpline.Y, posSpline.Z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
 end
@@ -110,7 +134,55 @@ local function clearLines(t)
     for i = #t, 1, -1 do t[i] = nil end
 end
 local function clearPath() clearLines(lines) drawnCount = 0 end
-local function clearMap() clearLines(mapSegs) end
+local function clearMap() clearLines(mapSegs) lastMapKey = nil end
+
+local function smoothSpd()
+    if not smoothTrail then return end
+    spdS = {}
+    local n = #spd
+    if n < 3 then
+        for i = 1, n do spdS[i] = spd[i] end
+        return
+    end
+    spdS[2] = spd[2]
+    for i = 3, n - 1 do
+        spdS[i] = (spd[i - 1] + spd[i] * 2 + spd[i + 1]) * 0.25
+    end
+    spdS[n] = spd[n]
+end
+
+local function recalcStat()
+    stat.dist, stat.maxV, stat.minV = 0, 0, math.huge
+    for i = 1, #frames do
+        if i >= 2 then
+            local dt = frames[i].t - frames[i - 1].t
+            if dt <= 0 then dt = 1 / rate end
+            stat.dist = stat.dist + (frames[i].cf.Position - frames[i - 1].cf.Position).Magnitude
+        end
+        local v = spd[i]
+        if v then
+            if v > stat.maxV then stat.maxV = v end
+            if v < stat.minV then stat.minV = v end
+        end
+    end
+    if stat.minV == math.huge then stat.minV = 0 end
+end
+
+local function pushFrame(t, cf)
+    local n = #frames
+    frames[n + 1] = { t = t, cf = cf }
+    if n >= 1 then
+        local pf = frames[n]
+        local dt = t - pf.t
+        if dt <= 0 then dt = 1 / rate end
+        local d = (cf.Position - pf.cf.Position).Magnitude
+        local v = d / dt
+        spd[n + 1] = v
+        stat.dist = stat.dist + d
+        if v > stat.maxV then stat.maxV = v end
+        if v < stat.minV then stat.minV = v end
+    end
+end
 
 local function refreshList()
     fileList = {}
@@ -139,21 +211,34 @@ local function stepFor(n)
     return math.ceil(n / MAX_SEGS)
 end
 
-local function addSeg(i, step)
-    if i <= 1 or i > #frames then return end
+local function segColor(i, prevColor)
+    local c = heatCol(smoothTrail and (spdS[i] or spd[i] or 0) or (spd[i] or 0))
+    if smoothTrail and prevColor then
+        return Color3.new((c.R + prevColor.R) * 0.5, (c.G + prevColor.G) * 0.5, (c.B + prevColor.B) * 0.5)
+    end
+    return c
+end
+
+local function addSeg(i, step, lastColor)
+    if i <= 1 or i > #frames then return lastColor end
     local j = math.max(1, i - step)
     local a, b = frames[j].cf.Position, frames[i].cf.Position
-    if (a - b).Magnitude < MIN_DIST then return end
+    if (a - b).Magnitude < MIN_DIST then return lastColor end
     local l = Drawing.new("Line")
     l.Thickness, l.ZIndex, l.Visible = 2, 500, false
-    table.insert(lines, { line = l, a = a, b = b, idx = i, idxA = j })
+    local hc = segColor(i, lastColor)
+    table.insert(lines, { line = l, a = a, b = b, idx = i, idxA = j, hc = hc })
+    return hc
 end
 
 local function rebuild()
     clearPath()
+    smoothSpd()
+    recalcStat()
     if #frames < 2 then return end
     local step = stepFor(#frames)
-    for i = step + 1, #frames, step do addSeg(i, step) end
+    local lastColor = nil
+    for i = step + 1, #frames, step do lastColor = addSeg(i, step, lastColor) end
     drawnCount = #frames
 end
 
@@ -191,50 +276,30 @@ local function rebuildMap()
     end
 end
 
-local function initTrimMarkers()
-    if not trimHeadSq then
-        trimHeadSq = Drawing.new("Square")
-        trimHeadSq.Filled, trimHeadSq.Thickness, trimHeadSq.ZIndex, trimHeadSq.Visible = false, 2, 520, false
-    end
-    if not trimHeadX1 then
-        trimHeadX1 = Drawing.new("Line")
-        trimHeadX1.Thickness, trimHeadX1.ZIndex, trimHeadX1.Visible = 2, 520, false
-    end
-    if not trimHeadX2 then
-        trimHeadX2 = Drawing.new("Line")
-        trimHeadX2.Thickness, trimHeadX2.ZIndex, trimHeadX2.Visible = 2, 520, false
-    end
-    if not trimTailSq then
-        trimTailSq = Drawing.new("Square")
-        trimTailSq.Filled, trimTailSq.Thickness, trimTailSq.ZIndex, trimTailSq.Visible = false, 2, 520, false
-    end
-    if not trimTailX1 then
-        trimTailX1 = Drawing.new("Line")
-        trimTailX1.Thickness, trimTailX1.ZIndex, trimTailX1.Visible = 2, 520, false
-    end
-    if not trimTailX2 then
-        trimTailX2 = Drawing.new("Line")
-        trimTailX2.Thickness, trimTailX2.ZIndex, trimTailX2.Visible = 2, 520, false
-    end
-    if not trimHeadMapCircle then
-        trimHeadMapCircle = Drawing.new("Circle")
-        trimHeadMapCircle.Filled, trimHeadMapCircle.NumSides, trimHeadMapCircle.Radius = true, 10, 5
-        trimHeadMapCircle.ZIndex, trimHeadMapCircle.Visible = 907, false
-    end
-    if not trimTailMapSquare then
-        trimTailMapSquare = Drawing.new("Square")
-        trimTailMapSquare.Filled, trimTailMapSquare.ZIndex, trimTailMapSquare.Visible = true, 907, false
-    end
+local function mkLine(z)
+    local l = Drawing.new("Line")
+    l.Thickness, l.ZIndex, l.Visible = 2, z, false
+    return l
 end
 
-initTrimMarkers()
+local function mkSq(z)
+    local s = Drawing.new("Square")
+    s.Filled, s.Thickness, s.ZIndex, s.Visible = false, 2, z, false
+    return s
+end
+
+trimHeadSq, trimHeadX1, trimHeadX2 = mkSq(520), mkLine(520), mkLine(520)
+trimTailSq, trimTailX1, trimTailX2 = mkSq(520), mkLine(520), mkLine(520)
+trimHeadMapCircle = Drawing.new("Circle")
+trimHeadMapCircle.Filled, trimHeadMapCircle.NumSides, trimHeadMapCircle.Radius = true, 10, 5
+trimHeadMapCircle.ZIndex, trimHeadMapCircle.Visible = 907, false
+trimTailMapSquare = Drawing.new("Square")
+trimTailMapSquare.Filled, trimTailMapSquare.ZIndex, trimTailMapSquare.Visible = true, 907, false
 
 local function computeTrimIndices()
     local n = #frames
     if n < 2 then return nil, nil end
-    local headIdx = 1
-    local tailIdx = n
-
+    local headIdx, tailIdx = 1, n
     if trimHS > 0 then
         local cut = frames[1].t + trimHS
         while headIdx < n and frames[headIdx].t < cut do headIdx = headIdx + 1 end
@@ -243,44 +308,48 @@ local function computeTrimIndices()
         local cut = frames[n].t - trimTS
         while tailIdx > 1 and frames[tailIdx].t > cut do tailIdx = tailIdx - 1 end
     end
-
     if trimH > 0 then headIdx = math.min(headIdx + trimH, n) end
     if trimT > 0 then tailIdx = math.max(tailIdx - trimT, 1) end
-
     if headIdx >= tailIdx then return nil, nil end
     return headIdx, tailIdx
 end
 
+local function hideTrim()
+    if not trimShown then return end
+    trimShown = false
+    trimHeadSq.Visible, trimHeadX1.Visible, trimHeadX2.Visible = false, false, false
+    trimTailSq.Visible, trimTailX1.Visible, trimTailX2.Visible = false, false, false
+    trimHeadMapCircle.Visible, trimTailMapSquare.Visible = false, false
+end
+
 local function updateTrimPreview()
-    if not showTrimPreview or #frames < 2 then
-        trimHeadSq.Visible, trimHeadX1.Visible, trimHeadX2.Visible = false, false, false
-        trimTailSq.Visible, trimTailX1.Visible, trimTailX2.Visible = false, false, false
-        trimHeadMapCircle.Visible, trimTailMapSquare.Visible = false, false
+    if not showTrimPreview or #frames < 2 or (trimH == 0 and trimT == 0 and trimHS == 0 and trimTS == 0) then
+        hideTrim()
         return
     end
     local headIdx, tailIdx = computeTrimIndices()
-    if not headIdx then
-        trimHeadSq.Visible, trimHeadX1.Visible, trimHeadX2.Visible = false, false, false
-        trimTailSq.Visible, trimTailX1.Visible, trimTailX2.Visible = false, false, false
-        trimHeadMapCircle.Visible, trimTailMapSquare.Visible = false, false
-        return
-    end
+    if not headIdx then hideTrim() return end
+    trimShown = true
 
     local hPos = frames[headIdx].cf.Position
     local tPos = frames[tailIdx].cf.Position
 
-    trimHeadSq.Color, trimHeadSq.Transparency = c3(headColor), headColor.a
-    trimHeadX1.Color, trimHeadX1.Transparency = c3(headColor), headColor.a
-    trimHeadX2.Color, trimHeadX2.Transparency = c3(headColor), headColor.a
-    trimTailSq.Color, trimTailSq.Transparency = c3(tailColor), tailColor.a
-    trimTailX1.Color, trimTailX1.Transparency = c3(tailColor), tailColor.a
-    trimTailX2.Color, trimTailX2.Transparency = c3(tailColor), tailColor.a
-    trimHeadMapCircle.Color, trimHeadMapCircle.Transparency = c3(headColor), headColor.a
-    trimTailMapSquare.Color, trimTailMapSquare.Transparency = c3(tailColor), tailColor.a
+    if trimCV ~= colorVer then
+        trimCV = colorVer
+        local hc, tc = c3(headColor), c3(tailColor)
+        trimHeadSq.Color, trimHeadSq.Transparency = hc, headColor.a
+        trimHeadX1.Color, trimHeadX1.Transparency = hc, headColor.a
+        trimHeadX2.Color, trimHeadX2.Transparency = hc, headColor.a
+        trimTailSq.Color, trimTailSq.Transparency = tc, tailColor.a
+        trimTailX1.Color, trimTailX1.Transparency = tc, tailColor.a
+        trimTailX2.Color, trimTailX2.Transparency = tc, tailColor.a
+        trimHeadMapCircle.Color, trimHeadMapCircle.Transparency = hc, headColor.a
+        trimTailMapSquare.Color, trimTailMapSquare.Transparency = tc, tailColor.a
+    end
 
+    local sz = 8
     local hS, hOn = WorldToScreen(hPos)
     if hOn and headIdx > 1 then
-        local sz = 8
         trimHeadSq.Position = Vector2.new(hS.X - sz, hS.Y - sz)
         trimHeadSq.Size = Vector2.new(sz * 2, sz * 2)
         trimHeadX1.From = Vector2.new(hS.X - sz, hS.Y - sz)
@@ -294,7 +363,6 @@ local function updateTrimPreview()
 
     local tS, tOn = WorldToScreen(tPos)
     if tOn and tailIdx < #frames then
-        local sz = 8
         trimTailSq.Position = Vector2.new(tS.X - sz, tS.Y - sz)
         trimTailSq.Size = Vector2.new(sz * 2, sz * 2)
         trimTailX1.From = Vector2.new(tS.X, tS.Y - sz - 4)
@@ -311,7 +379,6 @@ local function updateTrimPreview()
         local mx = mapX == 0 and (vp.X - mapSize) / 2 or mapX
         local my = mapY == 0 and 20 or mapY
         local pad, inner = 6, mapSize - 12
-
         local hx, hz = toMap(hPos)
         local tx, tz = toMap(tPos)
         if hx and headIdx > 1 then
@@ -339,7 +406,8 @@ end
 
 local function startRec()
     if S.play then stopPlay() end
-    frames, mapBounds = {}, nil
+    frames, mapBounds, spd, spdS = {}, nil, {}, {}
+    stat.dist, stat.maxV, stat.minV = 0, 0, math.huge
     clearPath() clearMap()
     t0, lastS = tick(), 0
     lastCf, lastCfT = nil, 0
@@ -409,54 +477,27 @@ end
 
 local function setLoop(v) if S.loop_ == v then return end S.loop_ = v UI.SetValue("r_loop", v) end
 
-local function trimHead(n)
-    if n <= 0 or n >= #frames then return 0 end
-    local r = 0
-    for _ = 1, n do table.remove(frames, 1) r = r + 1 end
-    local off = frames[1].t
-    for _, f in ipairs(frames) do f.t = f.t - off end
-    rebuild() rebuildMap()
-    return r
-end
-
-local function trimTail(n)
-    if n <= 0 or n >= #frames then return 0 end
-    local r = 0
-    for _ = 1, n do table.remove(frames) r = r + 1 end
-    rebuild() rebuildMap()
-    return r
-end
-
-local function trimSecHead(sec)
-    if sec <= 0 or #frames < 2 then return 0 end
-    local cut = frames[1].t + sec
-    local r = 0
-    while #frames > 1 and frames[1].t < cut do table.remove(frames, 1) r = r + 1 end
-    local off = frames[1].t
-    for _, f in ipairs(frames) do f.t = f.t - off end
-    rebuild() rebuildMap()
-    return r
-end
-
-local function trimSecTail(sec)
-    if sec <= 0 or #frames < 2 then return 0 end
-    local cut = frames[#frames].t - sec
-    local r = 0
-    while #frames > 1 and frames[#frames].t > cut do table.remove(frames) r = r + 1 end
-    rebuild() rebuildMap()
-    return r
-end
-
 local function applyTrim()
     if #frames < 3 then
         notify("Not enough frames", "Recorder", 2)
         return
     end
+    local hi, ti = computeTrimIndices()
+    if not hi then
+        notify("Invalid trim", "Recorder", 2)
+        return
+    end
+    if hi == 1 and ti == #frames then
+        notify("Nothing to trim", "Recorder", 2)
+        return
+    end
+    setPlay(false)
     local n0 = #frames
-    if trimHS > 0 then trimSecHead(trimHS) end
-    if trimTS > 0 then trimSecTail(trimTS) end
-    if trimH > 0 and #frames > trimT + 1 then trimHead(trimH) end
-    if trimT > 0 and #frames > 1 then trimTail(trimT) end
+    local nf = {}
+    local off = frames[hi].t
+    for i = hi, ti do nf[#nf + 1] = { t = frames[i].t - off, cf = frames[i].cf } end
+    frames = nf
+    rebuild() rebuildMap()
     resetTrimValues()
     notify(string.format("Trim: %d -> %d", n0, #frames), "Recorder", 2)
 end
@@ -498,7 +539,7 @@ local function saveCfg()
         pSpeed = pSpeed, rate = rate, file = file,
         showPath = showPath, showHud = showHud, showGraph = showGraph, showBar = showBar, showMap = showMap,
         mapSize = mapSize, mapX = mapX, mapY = mapY, hudX = hudX, hudY = hudY,
-        showTrimPreview = showTrimPreview,
+        showTrimPreview = showTrimPreview, heat = heat, liveTrail = liveTrail, smoothTrail = smoothTrail,
         pathColor = pathColor, headColor = headColor, tailColor = tailColor, trimColor = trimColor,
     }
     return pcall(writefile, cfgFile, HttpService:JSONEncode(out))
@@ -506,11 +547,12 @@ end
 
 local function readColor(v, fb)
     if type(v) ~= "table" then return fb end
-    local r = type(v.r) == "number" and v.r or fb.r
-    local g = type(v.g) == "number" and v.g or fb.g
-    local b = type(v.b) == "number" and v.b or fb.b
-    local a = type(v.a) == "number" and v.a or fb.a
-    return {r = r, g = g, b = b, a = a}
+    return {
+        r = type(v.r) == "number" and v.r or fb.r,
+        g = type(v.g) == "number" and v.g or fb.g,
+        b = type(v.b) == "number" and v.b or fb.b,
+        a = type(v.a) == "number" and v.a or fb.a,
+    }
 end
 
 local function loadCfg()
@@ -529,10 +571,13 @@ local function loadCfg()
     mapSize, mapX, mapY = n(d.mapSize, mapSize), n(d.mapX, mapX), n(d.mapY, mapY)
     hudX, hudY = n(d.hudX, hudX), n(d.hudY, hudY)
     showTrimPreview = b(d.showTrimPreview, showTrimPreview)
+    heat, liveTrail = b(d.heat, heat), b(d.liveTrail, liveTrail)
+    smoothTrail = b(d.smoothTrail, smoothTrail)
     pathColor = readColor(d.pathColor, pathColor)
     headColor = readColor(d.headColor, headColor)
     tailColor = readColor(d.tailColor, tailColor)
     trimColor = readColor(d.trimColor, trimColor)
+    colorVer = colorVer + 1
     return true
 end
 
@@ -542,6 +587,7 @@ local function syncUI()
         {"r_graph", showGraph}, {"r_bar", showBar}, {"r_hud_x", hudX}, {"r_hud_y", hudY},
         {"r_map", showMap}, {"r_map_size", mapSize}, {"r_map_x", mapX}, {"r_map_y", mapY},
         {"r_name", file}, {"r_trim_preview", showTrimPreview},
+        {"r_heat", heat}, {"r_live", liveTrail}, {"r_smooth", smoothTrail},
         {"r_trim_h", 0}, {"r_trim_t", 0}, {"r_trim_hs", 0}, {"r_trim_ts", 0},
     }) do UI.SetValue(kv[1], kv[2]) end
     local idx = 0
@@ -564,6 +610,14 @@ local function mkSquare(color, trans, corner, z)
     return s
 end
 
+local function mkDot(sides, radius, z, color)
+    local c = Drawing.new("Circle")
+    c.Filled, c.NumSides, c.Radius = true, sides, radius
+    c.Transparency, c.ZIndex, c.Visible = 1, z, false
+    if color then c.Color = color end
+    return c
+end
+
 local function initHud()
     hudBg = mkSquare(Color3.fromRGB(12, 12, 18), 0.5, 6, 900)
     hudBorder = mkSquare(Color3.fromRGB(120, 220, 180), 0.85, 6, 901)
@@ -582,15 +636,9 @@ local function initHud()
     mapBorder.Thickness = 1
     mapTitle = mkText(12, Drawing.Fonts.SystemBold, Color3.fromRGB(180, 255, 220))
     mapTitle.Text = "ROUTE"
-    mapDotStart = Drawing.new("Circle")
-    mapDotStart.Filled, mapDotStart.NumSides, mapDotStart.Radius = true, 12, 4
-    mapDotStart.Transparency, mapDotStart.ZIndex, mapDotStart.Visible = 1, 904, false
-    mapDotEnd = Drawing.new("Circle")
-    mapDotEnd.Filled, mapDotEnd.NumSides, mapDotEnd.Radius = true, 12, 4
-    mapDotEnd.Transparency, mapDotEnd.ZIndex, mapDotEnd.Visible = 1, 904, false
-    mapDotCur = Drawing.new("Circle")
-    mapDotCur.Filled, mapDotCur.NumSides, mapDotCur.Radius = true, 14, 4.5
-    mapDotCur.Color, mapDotCur.Transparency, mapDotCur.ZIndex, mapDotCur.Visible = Color3.fromRGB(255, 255, 255), 1, 905, false
+    mapDotStart = mkDot(12, 4, 904, Color3.fromRGB(90, 255, 130))
+    mapDotEnd = mkDot(12, 4, 904, Color3.fromRGB(255, 90, 90))
+    mapDotCur = mkDot(14, 4.5, 905, Color3.fromRGB(255, 255, 255))
 end
 
 initHud()
@@ -611,35 +659,42 @@ RunService.Heartbeat:Connect(function()
     local h = hrp()
     if not h then return end
     local now = tick()
-
     local interval = 1 / rate
     local cfNow = h.CFrame
 
     if not lastCf then
         lastCf, lastCfT = cfNow, now
-        lastS = now
-        table.insert(frames, { t = now - t0, cf = cfNow })
+        pushFrame(now - t0, cfNow)
+        drawnCount = #frames
         return
     end
 
     local elapsed = now - lastCfT
     if elapsed < interval then return end
-
     local steps = math.floor(elapsed / interval)
     if steps <= 0 then return end
 
     for k = 1, steps do
-        local alpha = (k * interval) / elapsed
-        if alpha > 1 then alpha = 1 end
-        local interp = lerpCf(lastCf, cfNow, alpha)
-        local sampleT = lastCfT + k * interval - t0
-        table.insert(frames, { t = sampleT, cf = interp })
+        local alpha = math.min(1, (k * interval) / elapsed)
+        pushFrame(lastCfT + k * interval - t0, lerpCf(lastCf, cfNow, alpha))
     end
 
     if steps >= 2 then frameGaps = frameGaps + (steps - 1) end
 
-    lastCf, lastCfT = cfNow, now
-    lastS = now
+    local adv = steps * interval
+    lastCf = lerpCf(lastCf, cfNow, math.min(1, adv / elapsed))
+    lastCfT = lastCfT + adv
+
+    if liveTrail and not frameOverflow and #frames - drawnCount >= LIVE_BATCH then
+        if #frames <= MAX_SEGS then
+            local lastColor = #lines > 0 and lines[#lines].hc or nil
+            for i = drawnCount + 1, #frames do lastColor = addSeg(i, 1, lastColor) end
+        else
+            rebuild()
+            rebuildMap()
+        end
+        drawnCount = #frames
+    end
 
     if not frameOverflow and #frames >= MAX_FRAMES then
         frameOverflow = true
@@ -648,33 +703,19 @@ RunService.Heartbeat:Connect(function()
     end
 end)
 
-local function speeds()
-    local n = #frames
-    if n < 2 then return {}, 0 end
-    local out, mx = {}, 0.001
-    for i = 2, n do
-        local dt = frames[i].t - frames[i - 1].t
-        if dt <= 0 then dt = 1 / rate end
-        local v = (frames[i].cf.Position - frames[i - 1].cf.Position).Magnitude / dt
-        out[i] = v
-        if v > mx then mx = v end
-    end
-    return out, mx
-end
-
 local function updatePath()
     if not showPath or #lines == 0 then
-        for _, e in ipairs(lines) do e.line.Visible = false end
+        for _, e in ipairs(lines) do
+            if e.on ~= false then e.line.Visible, e.on = false, false end
+        end
         return
     end
 
     local headIdx, tailIdx = nil, nil
     if showTrimPreview then headIdx, tailIdx = computeTrimIndices() end
 
-    local pc = c3(pathColor)
-    local pt = pathColor.a
-    local tc = c3(trimColor)
-    local tt = trimColor.a
+    local pc, pt = c3(pathColor), pathColor.a
+    local tc, tt = c3(trimColor), trimColor.a
 
     for _, e in ipairs(lines) do
         local a2, aOn = WorldToScreen(e.a)
@@ -685,10 +726,12 @@ local function updatePath()
                 e.line.From, e.line.To, e.line.Visible = a2, b2, true
                 e.lastA, e.lastB, e.on = a2, b2, true
             end
-            if inTrim then
-                e.line.Color, e.line.Transparency = tc, tt
-            else
-                e.line.Color, e.line.Transparency = pc, pt
+            local state = inTrim and 1 or (heat and 2 or 0)
+            if e.cs ~= state or e.cv ~= colorVer then
+                if state == 1 then e.line.Color, e.line.Transparency = tc, tt
+                elseif state == 2 then e.line.Color, e.line.Transparency = e.hc, pt
+                else e.line.Color, e.line.Transparency = pc, pt end
+                e.cs, e.cv = state, colorVer
             end
         elseif e.on ~= false then
             e.line.Visible, e.on = false, false
@@ -696,182 +739,207 @@ local function updatePath()
     end
 end
 
+local rowCols = {
+    [0] = Color3.fromRGB(120, 120, 130),
+    [1] = Color3.fromRGB(150, 255, 190),
+    [2] = Color3.fromRGB(255, 180, 90),
+}
+
+local function setRow(i, txt, st)
+    local k = txt .. st
+    if cachedText[i] ~= k then
+        local t = hudRows[i]
+        t.Text, t.Color = txt, rowCols[st]
+        cachedText[i] = k
+    end
+end
+
+local function hideHud()
+    hudBg.Visible, hudBorder.Visible, hudTitle.Visible = false, false, false
+    for _, t in ipairs(hudRows) do t.Visible = false end
+    graphBg.Visible = false
+    for _, s in ipairs(graphSegs) do s.Visible = false end
+    barBg.Visible, barFill.Visible, barText.Visible = false, false, false
+    hudShown, hudLayoutKey, lastGraphKey, lastBarKey = false, nil, nil, nil
+end
+
 local function updateHud()
     if not showHud then
-        hudBg.Visible, hudBorder.Visible, hudTitle.Visible = false, false, false
-        for _, t in ipairs(hudRows) do t.Visible = false end
-        graphBg.Visible = false
-        for _, s in ipairs(graphSegs) do s.Visible = false end
-        barBg.Visible, barFill.Visible, barText.Visible = false, false, false
+        if hudShown then hideHud() end
         return
     end
-    local fStr = "Frames: " .. #frames
-    local rateStr
-    if S.rec and #frames > 1 then
-        local span = frames[#frames].t - frames[1].t
-        if span > 0 then
-            rateStr = string.format("Eff: %.1f Hz  gaps: %d", (#frames - 1) / span, frameGaps)
-        else
-            rateStr = "Eff: --"
-        end
-    else
-        rateStr = "Eff: --"
-    end
-    if cachedText.frames ~= fStr then hudRows[4].Text = fStr cachedText.frames = fStr end
-    if cachedText.rate ~= rateStr then hudRows[5].Text = rateStr cachedText.rate = rateStr end
+    hudShown = true
+    local n = #frames
+    local dur = n >= 2 and frames[n].t - frames[1].t or 0
 
-    local padX, padY, rowH, w = 10, 8, 18, 230
+    setRow(1, "[R]  Recording", S.rec and 1 or 0)
+    setRow(2, "[P]  Playing", S.play and 1 or 0)
+    setRow(3, "[L]  Loop", S.loop_ and 1 or 0)
+    setRow(4, string.format("Frames: %d  Live: %s", n, liveTrail and "on" or "off"), n > 0 and 1 or 0)
+    if S.rec and n > 1 and dur > 0 then
+        setRow(5, string.format("Eff: %.1f Hz  gaps: %d", (n - 1) / dur, frameGaps), frameGaps > 0 and 2 or 1)
+    else
+        setRow(5, "Eff: --", 0)
+    end
+
+    local padX, padY, rowH, w = 10, 8, 18, 250
     local gH = showGraph and 40 or 0
     local bH = showBar and 26 or 0
-    local h = padY * 2 + 20 + rowH * 5 + gH + bH
+    local baseY = hudY + padY + 20 + rowH * 5
+    local gx, gy, gw, gh = hudX + padX, baseY, w - padX * 2, gH - 6
+    local bx, by = hudX + padX, baseY + gH + 4
 
-    hudBg.Position, hudBg.Size = Vector2.new(hudX, hudY), Vector2.new(w, h)
-    hudBg.Visible = true
-    hudBorder.Position, hudBorder.Size = Vector2.new(hudX, hudY), Vector2.new(w, h)
-    hudBorder.Color = S.rec and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(120, 220, 180)
-    hudBorder.Visible = true
-    hudTitle.Position = Vector2.new(hudX + padX, hudY + padY)
-    hudTitle.Visible = true
-
-    local rows = {
-        { l = "[R]", n = "Recording", on = S.rec },
-        { l = "[P]", n = "Playing", on = S.play },
-        { l = "[L]", n = "Loop", on = S.loop_ },
-    }
-    for i = 1, 3 do
-        local r = rows[i]
-        local t = hudRows[i]
-        local txt = string.format("%-4s %s", r.l, r.n)
-        if cachedText[i] ~= txt then t.Text = txt cachedText[i] = txt end
-        t.Position = Vector2.new(hudX + padX, hudY + padY + 20 + (i - 1) * rowH)
-        t.Color = r.on and Color3.fromRGB(150, 255, 190) or Color3.fromRGB(120, 120, 130)
-        t.Visible = true
+    local key = hudX .. "," .. hudY .. "," .. gH .. "," .. bH .. "," .. (S.rec and 1 or 0)
+    if key ~= hudLayoutKey then
+        hudLayoutKey = key
+        local h = padY * 2 + 20 + rowH * 5 + gH + bH
+        hudBg.Position, hudBg.Size, hudBg.Visible = Vector2.new(hudX, hudY), Vector2.new(w, h), true
+        hudBorder.Position, hudBorder.Size = Vector2.new(hudX, hudY), Vector2.new(w, h)
+        hudBorder.Color = S.rec and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(120, 220, 180)
+        hudBorder.Visible = true
+        hudTitle.Position, hudTitle.Visible = Vector2.new(hudX + padX, hudY + padY), true
+        for i = 1, 5 do
+            hudRows[i].Position = Vector2.new(hudX + padX, hudY + padY + 20 + (i - 1) * rowH)
+            hudRows[i].Visible = true
+        end
+        if showGraph then
+            graphBg.Position, graphBg.Size, graphBg.Visible = Vector2.new(gx, gy), Vector2.new(gw, gh), true
+        else
+            graphBg.Visible = false
+        end
+        if showBar then
+            barBg.Position, barBg.Size, barBg.Visible = Vector2.new(bx, by), Vector2.new(barW, barH), true
+            barText.Position = Vector2.new(bx, by + barH + 2)
+        else
+            barBg.Visible, barFill.Visible, barText.Visible = false, false, false
+        end
+        lastGraphKey, lastBarKey = nil, nil
     end
-    local t4 = hudRows[4]
-    t4.Position = Vector2.new(hudX + padX, hudY + padY + 20 + 3 * rowH)
-    t4.Color = #frames > 0 and Color3.fromRGB(150, 255, 190) or Color3.fromRGB(120, 120, 130)
-    t4.Visible = true
-    local t5 = hudRows[5]
-    t5.Position = Vector2.new(hudX + padX, hudY + padY + 20 + 4 * rowH)
-    t5.Color = frameGaps > 0 and Color3.fromRGB(255, 180, 90) or Color3.fromRGB(150, 255, 190)
-    t5.Visible = true
 
-    local cy = hudY + padY + 20 + rowH * 5
-    if showGraph then
-        local gx, gy, gw, gh = hudX + padX, cy, w - padX * 2, gH - 6
-        graphBg.Position, graphBg.Size, graphBg.Visible = Vector2.new(gx, gy), Vector2.new(gw, gh), true
-        local sp, mx = speeds()
-        local total = #frames
-        if total >= 2 then
-            graphMax = math.max(10, math.ceil(mx / 10) * 10)
-            local count = math.min(graphPts, total - 1)
-            local start = math.max(2, total - count + 1)
+    if showGraph and n >= 2 then
+        local endIdx = S.play and math.min(pIdx, n) or n
+        local gk = endIdx .. "," .. n .. "," .. colorVer .. "," .. stat.maxV .. "," .. (smoothTrail and 1 or 0)
+        if gk ~= lastGraphKey then
+            lastGraphKey = gk
+            graphMax = math.max(10, math.ceil(stat.maxV / 10) * 10)
+            local count = math.min(graphPts, endIdx - 1)
+            local start = math.max(2, endIdx - count + 1)
             local pts = {}
             for k = 0, count - 1 do
                 local i = start + k
-                if i > total then break end
-                table.insert(pts, { gx + gw * (k / math.max(1, count - 1)), gy + gh - ((sp[i] or 0) / graphMax) * gh })
+                if i > endIdx then break end
+                local v = smoothTrail and (spdS[i] or spd[i] or 0) or (spd[i] or 0)
+                table.insert(pts, { gx + gw * (k / math.max(1, count - 1)), gy + gh - (v / graphMax) * gh })
             end
-            local need = #pts - 1
+            local need = math.max(0, #pts - 1)
             while #graphSegs < need do
                 local l = Drawing.new("Line")
                 l.Thickness, l.ZIndex, l.Visible = 1, 903, false
                 table.insert(graphSegs, l)
             end
+            local gc = c3(pathColor)
             for i = 1, need do
                 local seg = graphSegs[i]
                 seg.From, seg.To, seg.Visible = Vector2.new(pts[i][1], pts[i][2]), Vector2.new(pts[i + 1][1], pts[i + 1][2]), true
-                seg.Color, seg.Transparency = c3(pathColor), pathColor.a * 0.9
+                seg.Color, seg.Transparency = gc, pathColor.a * 0.9
             end
             for i = need + 1, #graphSegs do graphSegs[i].Visible = false end
-        else
-            for _, s in ipairs(graphSegs) do s.Visible = false end
         end
-        cy = cy + gH
-    else
-        graphBg.Visible = false
+    elseif lastGraphKey ~= "off" then
         for _, s in ipairs(graphSegs) do s.Visible = false end
+        lastGraphKey = "off"
     end
 
     if showBar then
-        local bx, by = hudX + padX, cy + 4
-        local total, progress = #frames, 0
-        local label
-        if S.play and total >= 2 then
+        local progress, label = 0, nil
+        if S.play and n >= 2 then
             local curT = (tick() - pT0) * pSpeed
-            local lastT = frames[total].t
+            local lastT = frames[n].t
             if lastT > 0 then progress = math.clamp(curT / lastT, 0, 1) end
-            label = string.format("Play %d%%  %d/%d", math.floor(progress * 100 + 0.5), math.min(pIdx, total), total)
-        elseif S.rec and total >= 1 then
-            label = string.format("Rec %.1fs  %d frames", tick() - t0, total)
+            label = string.format("Play %d%%  %d/%d", math.floor(progress * 100 + 0.5), math.min(pIdx, n), n)
+        elseif S.rec and n >= 1 then
+            label = string.format("Rec %.1fs  %d frames", tick() - t0, n)
         else
-            label = string.format("Idle  %d frames", total)
+            label = string.format("Idle  %d frames", n)
         end
-        barBg.Position, barBg.Size, barBg.Visible = Vector2.new(bx, by), Vector2.new(barW, barH), true
-        barFill.Position, barFill.Size = Vector2.new(bx, by), Vector2.new(barW * progress, barH)
-        barFill.Color = S.play and c3(pathColor) or (S.rec and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(80, 80, 90))
-        barFill.Visible = true
-        barText.Text = label
-        barText.Position = Vector2.new(bx, by + barH + 2)
-        barText.Visible = true
-    else
-        barBg.Visible, barFill.Visible, barText.Visible = false, false, false
+        local bk = label .. "|" .. math.floor(progress * 1000) .. colorVer
+        if bk ~= lastBarKey then
+            lastBarKey = bk
+            barFill.Position, barFill.Size = Vector2.new(bx, by), Vector2.new(barW * progress, barH)
+            barFill.Color = S.play and c3(pathColor) or (S.rec and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(80, 80, 90))
+            barFill.Visible = true
+            barText.Text = label
+            barText.Visible = true
+        end
     end
+end
+
+local function hideMap()
+    mapBg.Visible, mapBorder.Visible, mapTitle.Visible = false, false, false
+    mapDotStart.Visible, mapDotEnd.Visible, mapDotCur.Visible = false, false, false
+    for _, s in ipairs(mapSegs) do s.line.Visible = false end
+    mapShown, lastMapKey = false, nil
 end
 
 local function updateMap()
     if not showMap or not mapBounds or #frames < 2 then
-        mapBg.Visible, mapBorder.Visible, mapTitle.Visible = false, false, false
-        mapDotStart.Visible, mapDotEnd.Visible, mapDotCur.Visible = false, false, false
-        for _, s in ipairs(mapSegs) do s.line.Visible = false end
+        if mapShown then hideMap() end
         return
     end
+    mapShown = true
     local vp = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
     local mx = mapX == 0 and (vp.X - mapSize) / 2 or mapX
     local my = mapY == 0 and 20 or mapY
     local pad, inner = 6, mapSize - 12
 
-    mapBg.Position, mapBg.Size, mapBg.Visible = Vector2.new(mx, my), Vector2.new(mapSize, mapSize), true
-    mapBorder.Position, mapBorder.Size, mapBorder.Visible = Vector2.new(mx, my), Vector2.new(mapSize, mapSize), true
-    mapTitle.Position, mapTitle.Visible = Vector2.new(mx + pad, my + pad), true
-
     local headIdx, tailIdx = nil, nil
     if showTrimPreview then headIdx, tailIdx = computeTrimIndices() end
 
-    local pc = c3(pathColor)
-    local pt = pathColor.a
-    local tc = c3(trimColor)
-    local tt = trimColor.a
+    local key = table.concat({ mapSize, mapX, mapY, vp.X, #frames, colorVer, headIdx or 0, tailIdx or 0, heat and 1 or 0, smoothTrail and 1 or 0 }, ",")
+    if key ~= lastMapKey then
+        lastMapKey = key
+        mapBg.Position, mapBg.Size, mapBg.Visible = Vector2.new(mx, my), Vector2.new(mapSize, mapSize), true
+        mapBorder.Position, mapBorder.Size, mapBorder.Visible = Vector2.new(mx, my), Vector2.new(mapSize, mapSize), true
+        mapTitle.Position, mapTitle.Visible = Vector2.new(mx + pad, my + pad), true
 
-    local step = stepFor(#frames)
-    local idx = 0
-    for i = step + 1, #frames, step do
-        idx = idx + 1
-        local l = mapSegs[idx]
-        if not l then break end
-        local ax, az = toMap(frames[i - step].cf.Position)
-        local bx, bz = toMap(frames[i].cf.Position)
-        local inTrim = headIdx and (i <= headIdx or (i - step) > tailIdx)
-        if ax then
-            l.line.From = Vector2.new(mx + pad + ax * inner, my + pad + az * inner)
-            l.line.To = Vector2.new(mx + pad + bx * inner, my + pad + bz * inner)
-            if inTrim then
-                l.line.Color, l.line.Transparency = tc, tt * 0.7
+        local pc, pt = c3(pathColor), pathColor.a
+        local tc, tt = c3(trimColor), trimColor.a
+        local step = stepFor(#frames)
+        local idx = 0
+        for i = step + 1, #frames, step do
+            idx = idx + 1
+            local l = mapSegs[idx]
+            if not l then break end
+            local ax, az = toMap(frames[i - step].cf.Position)
+            local bx, bz = toMap(frames[i].cf.Position)
+            local inTrim = headIdx and (i <= headIdx or (i - step) > tailIdx)
+            if ax then
+                l.line.From = Vector2.new(mx + pad + ax * inner, my + pad + az * inner)
+                l.line.To = Vector2.new(mx + pad + bx * inner, my + pad + bz * inner)
+                if inTrim then l.line.Color, l.line.Transparency = tc, tt * 0.7
+                elseif heat then
+                    local v = smoothTrail and (spdS[i] or spd[i] or 0) or (spd[i] or 0)
+                    l.line.Color, l.line.Transparency = heatCol(v), pt * 0.7
+                else l.line.Color, l.line.Transparency = pc, pt * 0.7 end
+                l.line.Visible = true
             else
-                l.line.Color, l.line.Transparency = pc, pt * 0.7
+                l.line.Visible = false
             end
-            l.line.Visible = true
-        else l.line.Visible = false end
-    end
-    for i = idx + 1, #mapSegs do mapSegs[i].line.Visible = false end
+        end
+        for i = idx + 1, #mapSegs do mapSegs[i].line.Visible = false end
 
-    local sx, sz = toMap(frames[1].cf.Position)
-    if sx then mapDotStart.Position = Vector2.new(mx + pad + sx * inner, my + pad + sz * inner) mapDotStart.Visible = true end
-    local ex, ez = toMap(frames[#frames].cf.Position)
-    if ex then mapDotEnd.Position = Vector2.new(mx + pad + ex * inner, my + pad + ez * inner) mapDotEnd.Visible = true end
+        local sx, sz = toMap(frames[1].cf.Position)
+        if sx then mapDotStart.Position = Vector2.new(mx + pad + sx * inner, my + pad + sz * inner) mapDotStart.Visible = true end
+        local ex, ez = toMap(frames[#frames].cf.Position)
+        if ex then mapDotEnd.Position = Vector2.new(mx + pad + ex * inner, my + pad + ez * inner) mapDotEnd.Visible = true end
+    end
+
     local cur = frames[math.min(pIdx, #frames)] or frames[1]
     local cx, cz = toMap(cur.cf.Position)
-    if cx then mapDotCur.Position = Vector2.new(mx + pad + cx * inner, my + pad + cz * inner) mapDotCur.Visible = true end
+    if cx then
+        mapDotCur.Position = Vector2.new(mx + pad + cx * inner, my + pad + cz * inner)
+        mapDotCur.Visible = true
+    end
 end
 
 RunService.RenderStepped:Connect(function()
@@ -910,6 +978,13 @@ end)
 
 folder() refreshList() local cfgOk = loadCfg()
 
+local function colorCb(t)
+    return function(c, a)
+        t.r, t.g, t.b, t.a = math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5), a
+        colorVer = colorVer + 1
+    end
+end
+
 UI.AddTab("Recorder", function(tab)
     local s1 = tab:Section("Recorder", "Left")
     s1:Toggle("r_on", "Recording [R]", false, function(v) setRec(v) end)
@@ -919,7 +994,8 @@ UI.AddTab("Recorder", function(tab)
     s1:SliderFloat("r_spd", "Playback Speed", 0.1, 5.0, pSpeed, "%.2f", function(v) pSpeed = v end)
     s1:Button("Clear", 100, 20, function()
         setPlay(false)
-        frames, mapBounds = {}, nil
+        frames, mapBounds, spd, spdS = {}, nil, {}, {}
+        stat.dist, stat.maxV, stat.minV = 0, 0, math.huge
         clearPath() clearMap()
         lastCf, lastCfT = nil, 0
         frameGaps = 0
@@ -953,14 +1029,43 @@ UI.AddTab("Recorder", function(tab)
         refreshList() notify("Deleted " .. file, "Recorder", 2)
     end)
 
+    local s6 = tab:Section("Config", "Left")
+    s6:Button("Save Config", 120, 20, function()
+        if saveCfg() then notify("Config saved", "Recorder", 2) else notify("Save failed", "Recorder", 2) end
+    end)
+    s6:Button("Load Config", 120, 20, function()
+        if loadCfg() then syncUI() if showMap then rebuildMap() end notify("Config loaded", "Recorder", 2)
+        else notify("No config", "Recorder", 2) end
+    end)
+    s6:Button("Reset Config", 120, 20, function()
+        pSpeed, rate = 1.0, 20
+        showPath, showHud, showGraph, showBar, showMap = true, true, true, true, false
+        mapSize, mapX, mapY = 180, 0, 0
+        hudX, hudY = 20, 20
+        showTrimPreview = true
+        heat, liveTrail, smoothTrail = false, false, true
+        pathColor = {r = 120, g = 220, b = 180, a = 1}
+        headColor = {r = 255, g = 60, b = 60, a = 1}
+        tailColor = {r = 60, g = 180, b = 255, a = 1}
+        trimColor = {r = 255, g = 140, b = 40, a = 0.9}
+        colorVer = colorVer + 1
+        resetTrimValues()
+        syncUI() notify("Config reset", "Recorder", 2)
+    end)
+    s6:Button("Delete Config", 120, 20, function()
+        if isfile(cfgFile) then delfile(cfgFile) end
+        notify("Config deleted", "Recorder", 2)
+    end)
+
     local s3 = tab:Section("Path", "Right")
-    s3:Toggle("r_path", "Show Path", showPath, function(v)
+    s3:Toggle("r_path", "Show Trail", showPath, function(v)
         showPath = v
         if v then rebuild() end
     end)
-    s3:ColorPicker("r_path_col", pathColor.r/255, pathColor.g/255, pathColor.b/255, pathColor.a, function(c, a)
-        pathColor.r, pathColor.g, pathColor.b, pathColor.a = math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5), a
-    end)
+    s3:ColorPicker("r_path_col", pathColor.r / 255, pathColor.g / 255, pathColor.b / 255, pathColor.a, colorCb(pathColor))
+    s3:Toggle("r_heat", "Show Trail Speed", heat, function(v) heat = v colorVer = colorVer + 1 end)
+    s3:Toggle("r_live", "Live Trail", liveTrail, function(v) liveTrail = v end)
+    s3:Toggle("r_smooth", "Smooth Trail", smoothTrail, function(v) smoothTrail = v rebuild() end)
     s3:Toggle("r_hud", "Show HUD", showHud, function(v) showHud = v end)
     s3:Toggle("r_graph", "Speed Graph", showGraph, function(v) showGraph = v end)
     s3:Toggle("r_bar", "Progress Bar", showBar, function(v) showBar = v end)
@@ -971,15 +1076,9 @@ UI.AddTab("Recorder", function(tab)
 
     local s4 = tab:Section("Trim", "Left")
     s4:Toggle("r_trim_preview", "Show Trim Markers", showTrimPreview, function(v) showTrimPreview = v end)
-    s4:ColorPicker("r_head_col", headColor.r/255, headColor.g/255, headColor.b/255, headColor.a, function(c, a)
-        headColor.r, headColor.g, headColor.b, headColor.a = math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5), a
-    end)
-    s4:ColorPicker("r_tail_col", tailColor.r/255, tailColor.g/255, tailColor.b/255, tailColor.a, function(c, a)
-        tailColor.r, tailColor.g, tailColor.b, tailColor.a = math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5), a
-    end)
-    s4:ColorPicker("r_trim_col", trimColor.r/255, trimColor.g/255, trimColor.b/255, trimColor.a, function(c, a)
-        trimColor.r, trimColor.g, trimColor.b, trimColor.a = math.floor(c.R*255+0.5), math.floor(c.G*255+0.5), math.floor(c.B*255+0.5), a
-    end)
+    s4:ColorPicker("r_head_col", headColor.r / 255, headColor.g / 255, headColor.b / 255, headColor.a, colorCb(headColor))
+    s4:ColorPicker("r_tail_col", tailColor.r / 255, tailColor.g / 255, tailColor.b / 255, tailColor.a, colorCb(tailColor))
+    s4:ColorPicker("r_trim_col", trimColor.r / 255, trimColor.g / 255, trimColor.b / 255, trimColor.a, colorCb(trimColor))
     s4:SliderInt("r_trim_h", "Trim Head (frames)", 0, 700, 0, function(v) trimH = v end)
     s4:SliderInt("r_trim_t", "Trim Tail (frames)", 0, 700, 0, function(v) trimT = v end)
     s4:SliderFloat("r_trim_hs", "Trim Head (sec)", 0, 30, 0, "%.2f", function(v) trimHS = v end)
@@ -996,32 +1095,6 @@ UI.AddTab("Recorder", function(tab)
     s5:SliderInt("r_map_x", "Map X (0=auto)", 0, 1920, mapX, function(v) mapX = v end)
     s5:SliderInt("r_map_y", "Map Y (0=auto)", 0, 1080, mapY, function(v) mapY = v end)
     s5:Button("Rebuild Map", 120, 20, function() rebuildMap() end)
-
-    local s6 = tab:Section("Config", "Left")
-    s6:Button("Save Config", 120, 20, function()
-        if saveCfg() then notify("Config saved", "Recorder", 2) else notify("Save failed", "Recorder", 2) end
-    end)
-    s6:Button("Load Config", 120, 20, function()
-        if loadCfg() then syncUI() if showMap then rebuildMap() end notify("Config loaded", "Recorder", 2)
-        else notify("No config", "Recorder", 2) end
-    end)
-    s6:Button("Reset Config", 120, 20, function()
-        pSpeed, rate = 1.0, 20
-        showPath, showHud, showGraph, showBar, showMap = true, true, true, true, false
-        mapSize, mapX, mapY = 180, 0, 0
-        hudX, hudY = 20, 20
-        showTrimPreview = true
-        pathColor = {r = 120, g = 220, b = 180, a = 1}
-        headColor = {r = 255, g = 60, b = 60, a = 1}
-        tailColor = {r = 60, g = 180, b = 255, a = 1}
-        trimColor = {r = 255, g = 140, b = 40, a = 0.9}
-        resetTrimValues()
-        syncUI() notify("Config reset", "Recorder", 2)
-    end)
-    s6:Button("Delete Config", 120, 20, function()
-        if isfile(cfgFile) then delfile(cfgFile) end
-        notify("Config deleted", "Recorder", 2)
-    end)
 end)
 
 if cfgOk then syncUI() if showMap then rebuildMap() end end
