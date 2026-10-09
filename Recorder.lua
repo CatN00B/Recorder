@@ -1,6 +1,5 @@
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UIS = game:GetService("UserInputService")
 local HttpService = game:GetService("HttpService")
 
 local LP
@@ -34,6 +33,8 @@ local hudX, hudY = 20, 20
 local trimH, trimT, trimHS, trimTS = 0, 0, 0, 0
 local showTrimPreview = true
 local heat, liveTrail, smoothTrail = false, false, true
+local ghostOn, ghostT0 = false, 0
+local ghostColor = {r = 255, g = 120, b = 255, a = 0.9}
 
 local pathColor = {r = 120, g = 220, b = 180, a = 1}
 local headColor = {r = 255, g = 60, b = 60, a = 1}
@@ -70,6 +71,27 @@ local trimShown, trimCV = false, -1
 local trimHeadSq, trimHeadX1, trimHeadX2 = nil, nil, nil
 local trimTailSq, trimTailX1, trimTailX2 = nil, nil, nil
 local trimHeadMapCircle, trimTailMapSquare = nil, nil
+
+local ghostLines = {}
+local ghostShown = false
+local ghostCV, ghostCA = -1, -1
+
+local EDGES = {{0,1},{2,3},{4,5},{6,7},{0,2},{1,3},{4,6},{5,7},{0,4},{1,5},{2,6},{3,7}}
+local SX, SY, SZ = {}, {}, {}
+for i = 0, 7 do
+    SX[i + 1] = (i % 2 == 1) and 1 or -1
+    SY[i + 1] = (math.floor(i / 2) % 2 == 1) and 1 or -1
+    SZ[i + 1] = (i >= 4) and 1 or -1
+end
+local GHX, GHY, GHZ = 1.5, 3, 1.5
+local gsp, gso = {}, {}
+
+for i = 1, 13 do
+    local l = Drawing.new("Line")
+    l.Thickness = i == 13 and 2.5 or 1.5
+    l.ZIndex, l.Visible = 600, false
+    ghostLines[i] = l
+end
 
 local BANDS = {
     {Color3.fromRGB(70, 140, 255)},
@@ -123,6 +145,31 @@ local function splineCf(idx, alpha)
     return CFrame.new(posSpline.X, posSpline.Y, posSpline.Z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
 end
 
+local function findIdx(tbl, t)
+    local lo, hi = 1, #tbl
+    while lo < hi do
+        local mid = math.floor((lo + hi + 1) / 2)
+        if tbl[mid].t <= t then lo = mid else hi = mid - 1 end
+    end
+    return lo
+end
+
+local function sampleCf(tbl, t, spline)
+    local n = #tbl
+    if n == 0 then return nil end
+    if n == 1 or t <= tbl[1].t then return tbl[1].cf end
+    if t >= tbl[n].t then return tbl[n].cf end
+    local i = findIdx(tbl, t)
+    local a, b = tbl[i], tbl[i + 1]
+    local seg = b.t - a.t
+    local al = seg > 0 and (t - a.t) / seg or 0
+    if spline and tbl == frames then
+        local c = splineCf(i, al)
+        if c then return c end
+    end
+    return a.cf:Lerp(b.cf, al)
+end
+
 local function hrp()
     local c = LP.Character
     return c and c:FindFirstChild("HumanoidRootPart")
@@ -135,6 +182,78 @@ local function clearLines(t)
 end
 local function clearPath() clearLines(lines) drawnCount = 0 end
 local function clearMap() clearLines(mapSegs) lastMapKey = nil end
+
+local function hideGhost()
+    if not ghostShown then return end
+    ghostShown = false
+    for _, l in ipairs(ghostLines) do l.Visible = false end
+end
+
+local function showGhost(cf)
+    if ghostCV ~= colorVer or ghostCA ~= ghostColor.a then
+        local c = c3(ghostColor)
+        for _, l in ipairs(ghostLines) do l.Color, l.Transparency = c, ghostColor.a end
+        ghostCV, ghostCA = colorVer, ghostColor.a
+    end
+    local c = { cf:GetComponents() }
+    local px, py, pz = c[1], c[2], c[3]
+    local rx, ry, rz = c[4], c[7], c[10]
+    local ux, uy, uz = c[5], c[8], c[11]
+    local bx, by, bz = c[6], c[9], c[12]
+    for i = 1, 8 do
+        local sx, sy, sz = SX[i] * GHX, SY[i] * GHY, SZ[i] * GHZ
+        gsp[i], gso[i] = WorldToScreen(Vector3.new(
+            px + rx * sx + ux * sy + bx * sz,
+            py + ry * sx + uy * sy + by * sz,
+            pz + rz * sx + uz * sy + bz * sz
+        ))
+    end
+    for k = 1, 12 do
+        local a, b = EDGES[k][1] + 1, EDGES[k][2] + 1
+        local l = ghostLines[k]
+        if gso[a] and gso[b] then
+            l.From, l.To, l.Visible = gsp[a], gsp[b], true
+        else
+            l.Visible = false
+        end
+    end
+    local cs, con = WorldToScreen(Vector3.new(px, py, pz))
+    local fs, fon = WorldToScreen(Vector3.new(px - bx * 4, py - by * 4, pz - bz * 4))
+    local al = ghostLines[13]
+    if con and fon then
+        al.From, al.To, al.Visible = cs, fs, true
+    else
+        al.Visible = false
+    end
+    ghostShown = true
+end
+
+local function setGhost(v)
+    if ghostOn == v then return end
+    if v then
+        if #frames < 2 then
+            notify("No recording", "Recorder", 2)
+            UI.SetValue("r_ghost", false)
+            return
+        end
+        if S.play then
+            notify("Stop playback first", "Recorder", 2)
+            UI.SetValue("r_ghost", false)
+            return
+        end
+        if S.rec then
+            notify("Stop recording first", "Recorder", 2)
+            UI.SetValue("r_ghost", false)
+            return
+        end
+        ghostOn = true
+        ghostT0 = tick()
+    else
+        ghostOn = false
+        hideGhost()
+    end
+    UI.SetValue("r_ghost", v)
+end
 
 local function smoothSpd()
     if not smoothTrail then return end
@@ -153,17 +272,16 @@ end
 
 local function recalcStat()
     stat.dist, stat.maxV, stat.minV = 0, 0, math.huge
-    for i = 1, #frames do
-        if i >= 2 then
-            local dt = frames[i].t - frames[i - 1].t
-            if dt <= 0 then dt = 1 / rate end
-            stat.dist = stat.dist + (frames[i].cf.Position - frames[i - 1].cf.Position).Magnitude
-        end
-        local v = spd[i]
-        if v then
-            if v > stat.maxV then stat.maxV = v end
-            if v < stat.minV then stat.minV = v end
-        end
+    spd = {}
+    for i = 2, #frames do
+        local dt = frames[i].t - frames[i - 1].t
+        if dt <= 0 then dt = 1 / rate end
+        local d = (frames[i].cf.Position - frames[i - 1].cf.Position).Magnitude
+        local v = d / dt
+        spd[i] = v
+        stat.dist = stat.dist + d
+        if v > stat.maxV then stat.maxV = v end
+        if v < stat.minV then stat.minV = v end
     end
     if stat.minV == math.huge then stat.minV = 0 end
 end
@@ -406,6 +524,7 @@ end
 
 local function startRec()
     if S.play then stopPlay() end
+    if ghostOn then setGhost(false) end
     frames, mapBounds, spd, spdS = {}, nil, {}, {}
     stat.dist, stat.maxV, stat.minV = 0, 0, math.huge
     clearPath() clearMap()
@@ -422,6 +541,7 @@ end
 local function startPlay()
     if #frames < 2 then return false end
     if S.play then stopPlay() end
+    if ghostOn then setGhost(false) end
     local h = hrp()
     if not h then return false end
     pT0, pIdx = tick(), 1
@@ -521,6 +641,8 @@ local function load()
     if not ok or not raw then return false end
     local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
     if not ok2 or type(data) ~= "table" or type(data.frames) ~= "table" then return false end
+    setPlay(false)
+    if ghostOn then setGhost(false) end
     frames = {}
     for i, f in ipairs(data.frames) do
         if f.p and f.l then
@@ -541,6 +663,7 @@ local function saveCfg()
         mapSize = mapSize, mapX = mapX, mapY = mapY, hudX = hudX, hudY = hudY,
         showTrimPreview = showTrimPreview, heat = heat, liveTrail = liveTrail, smoothTrail = smoothTrail,
         pathColor = pathColor, headColor = headColor, tailColor = tailColor, trimColor = trimColor,
+        ghostColor = ghostColor,
     }
     return pcall(writefile, cfgFile, HttpService:JSONEncode(out))
 end
@@ -577,6 +700,7 @@ local function loadCfg()
     headColor = readColor(d.headColor, headColor)
     tailColor = readColor(d.tailColor, tailColor)
     trimColor = readColor(d.trimColor, trimColor)
+    ghostColor = readColor(d.ghostColor, ghostColor)
     colorVer = colorVer + 1
     return true
 end
@@ -651,8 +775,9 @@ RunService.Heartbeat:Connect(function()
         if edge("R", 0x52) then setRec(not S.rec) end
         if edge("P", 0x50) then setPlay(not S.play) end
         if edge("L", 0x4C) then setLoop(not S.loop_) end
+        if edge("G", 0x47) then setGhost(not ghostOn) end
     else
-        prevKeys.R, prevKeys.P, prevKeys.L = keyDown(0x52), keyDown(0x50), keyDown(0x4C)
+        prevKeys.R, prevKeys.P, prevKeys.L, prevKeys.G = keyDown(0x52), keyDown(0x50), keyDown(0x4C), keyDown(0x47)
     end
 
     if not S.rec or S.play then return end
@@ -774,8 +899,8 @@ local function updateHud()
 
     setRow(1, "[R]  Recording", S.rec and 1 or 0)
     setRow(2, "[P]  Playing", S.play and 1 or 0)
-    setRow(3, "[L]  Loop", S.loop_ and 1 or 0)
-    setRow(4, string.format("Frames: %d  Live: %s", n, liveTrail and "on" or "off"), n > 0 and 1 or 0)
+    setRow(3, "[L] Loop  [G] Ghost", (S.loop_ or ghostOn) and 1 or 0)
+    setRow(4, string.format("Frames: %d  Ghost: %s", n, ghostOn and "on" or "off"), n > 0 and 1 or 0)
     if S.rec and n > 1 and dur > 0 then
         setRow(5, string.format("Eff: %.1f Hz  gaps: %d", (n - 1) / dur, frameGaps), frameGaps > 0 and 2 or 1)
     else
@@ -859,6 +984,11 @@ local function updateHud()
             label = string.format("Play %d%%  %d/%d", math.floor(progress * 100 + 0.5), math.min(pIdx, n), n)
         elseif S.rec and n >= 1 then
             label = string.format("Rec %.1fs  %d frames", tick() - t0, n)
+        elseif ghostOn and n >= 2 then
+            local el = (tick() - ghostT0) * pSpeed
+            local lastT = frames[n].t
+            if lastT > 0 then progress = math.clamp(el / lastT, 0, 1) end
+            label = string.format("Ghost %d%%", math.floor(progress * 100 + 0.5))
         else
             label = string.format("Idle  %d frames", n)
         end
@@ -866,7 +996,7 @@ local function updateHud()
         if bk ~= lastBarKey then
             lastBarKey = bk
             barFill.Position, barFill.Size = Vector2.new(bx, by), Vector2.new(barW * progress, barH)
-            barFill.Color = S.play and c3(pathColor) or (S.rec and Color3.fromRGB(255, 90, 90) or Color3.fromRGB(80, 80, 90))
+            barFill.Color = S.play and c3(pathColor) or (S.rec and Color3.fromRGB(255, 90, 90) or (ghostOn and c3(ghostColor) or Color3.fromRGB(80, 80, 90)))
             barFill.Visible = true
             barText.Text = label
             barText.Visible = true
@@ -942,6 +1072,26 @@ local function updateMap()
     end
 end
 
+local function updateGhost()
+    if not ghostOn then
+        if ghostShown then hideGhost() end
+        return
+    end
+    local n = #frames
+    if n < 2 then
+        setGhost(false)
+        return
+    end
+    local T = frames[n].t
+    local el = (tick() - ghostT0) * pSpeed
+    if el >= T then
+        setGhost(false)
+        return
+    end
+    local cf = sampleCf(frames, el, true)
+    if cf then showGhost(cf) else hideGhost() end
+end
+
 RunService.RenderStepped:Connect(function()
     if S.play then
         local h = hrp()
@@ -966,6 +1116,8 @@ RunService.RenderStepped:Connect(function()
         end
     end
 
+    updateGhost()
+
     visualTick = visualTick + 1
     if visualTick >= VISUAL_THROTTLE then
         visualTick = 0
@@ -985,6 +1137,29 @@ local function colorCb(t)
     end
 end
 
+local function fullReset()
+    setPlay(false)
+    setRec(false)
+    setGhost(false)
+    frames, mapBounds, spd, spdS = {}, nil, {}, {}
+    stat.dist, stat.maxV, stat.minV = 0, 0, math.huge
+    clearPath()
+    clearMap()
+    clearLines(graphSegs)
+    lastCf, lastCfT = nil, 0
+    frameGaps = 0
+    frameOverflow = false
+    drawnCount = 0
+    visualTick = 0
+    trimCV = -1
+    lastGraphKey, lastBarKey, lastMapKey = nil, nil, nil
+    cachedText = {}
+    hudShown, mapShown, trimShown = false, false, false
+    hudLayoutKey = nil
+    resetTrimValues()
+    notify("Recorder reset", "Recorder", 2)
+end
+
 UI.AddTab("Recorder", function(tab)
     local s1 = tab:Section("Recorder", "Left")
     s1:Toggle("r_on", "Recording [R]", false, function(v) setRec(v) end)
@@ -992,14 +1167,7 @@ UI.AddTab("Recorder", function(tab)
     s1:Toggle("r_loop", "Loop [L]", false, function(v) setLoop(v) end)
     s1:SliderInt("r_rate", "Sample Rate", 5, 60, rate, function(v) rate = v end)
     s1:SliderFloat("r_spd", "Playback Speed", 0.1, 5.0, pSpeed, "%.2f", function(v) pSpeed = v end)
-    s1:Button("Clear", 100, 20, function()
-        setPlay(false)
-        frames, mapBounds, spd, spdS = {}, nil, {}, {}
-        stat.dist, stat.maxV, stat.minV = 0, 0, math.huge
-        clearPath() clearMap()
-        lastCf, lastCfT = nil, 0
-        frameGaps = 0
-    end)
+    s1:Button("Reset", 100, 20, function() fullReset() end)
 
     local s2 = tab:Section("Files", "Left")
     s2:InputText("r_name", "Name", file, function(t)
@@ -1048,6 +1216,7 @@ UI.AddTab("Recorder", function(tab)
         headColor = {r = 255, g = 60, b = 60, a = 1}
         tailColor = {r = 60, g = 180, b = 255, a = 1}
         trimColor = {r = 255, g = 140, b = 40, a = 0.9}
+        ghostColor = {r = 255, g = 120, b = 255, a = 0.9}
         colorVer = colorVer + 1
         resetTrimValues()
         syncUI() notify("Config reset", "Recorder", 2)
@@ -1066,6 +1235,8 @@ UI.AddTab("Recorder", function(tab)
     s3:Toggle("r_heat", "Show Trail Speed", heat, function(v) heat = v colorVer = colorVer + 1 end)
     s3:Toggle("r_live", "Live Trail", liveTrail, function(v) liveTrail = v end)
     s3:Toggle("r_smooth", "Smooth Trail", smoothTrail, function(v) smoothTrail = v rebuild() end)
+    s3:Toggle("r_ghost", "Ghost Preview [G]", false, function(v) setGhost(v) end)
+    s3:ColorPicker("r_ghost_col", ghostColor.r / 255, ghostColor.g / 255, ghostColor.b / 255, ghostColor.a, colorCb(ghostColor))
     s3:Toggle("r_hud", "Show HUD", showHud, function(v) showHud = v end)
     s3:Toggle("r_graph", "Speed Graph", showGraph, function(v) showGraph = v end)
     s3:Toggle("r_bar", "Progress Bar", showBar, function(v) showBar = v end)
