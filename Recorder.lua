@@ -673,8 +673,7 @@ local function hideHud()
     local H = DR.hud
     H.bg.Visible, H.border.Visible, H.title.Visible = false, false, false
     for _, t in ipairs(H.rows) do t.Visible = false end
-    H.gbg.Visible = false
-    for _, s in ipairs(D.graphSegs) do s.Visible = false end
+    H.gbg.Visible = false    for _, s in ipairs(D.graphSegs) do s.Visible = false end
     H.bbg.Visible, H.bfill.Visible, H.btext.Visible = false, false, false
     S.hudShown, S.hudKey, S.gKey, S.bKey = false, nil, nil, nil
 end
@@ -998,30 +997,63 @@ end
 
 local function applyTrim()
     local fr = D.frames
-    if #fr < 3 then
+    local n = #fr
+    if n < 3 then
         notify("Not enough frames", "Recorder", 2)
         return
     end
-    local hi, ti = computeTrimIndices()
-    if not hi then
+    local tr = S.tr
+    if tr.h == 0 and tr.t == 0 and tr.hs == 0 and tr.ts == 0 then
+        notify("Set trim first", "Recorder", 2)
+        return
+    end
+    local hi, ti = 1, n
+    if tr.hs > 0 then
+        local cut = fr[1].t + tr.hs
+        while hi < n and fr[hi].t < cut do hi = hi + 1 end
+    end
+    if tr.ts > 0 then
+        local cut = fr[n].t - tr.ts
+        while ti > 1 and fr[ti].t > cut do ti = ti - 1 end
+    end
+    if tr.h > 0 then hi = math.min(hi + tr.h, n) end
+    if tr.t > 0 then ti = math.max(ti - tr.t, 1) end
+    if hi >= ti then
         notify("Invalid trim", "Recorder", 2)
         return
     end
-    if hi == 1 and ti == #fr then
+    if hi == 1 and ti == n then
         notify("Nothing to trim", "Recorder", 2)
         return
     end
-    setPlay(false)
+
+    if S.play then setPlay(false) end
     if S.ghost then setGhost(false) end
-    local n0 = #fr
+
+    local n0 = n
     local off = fr[hi].t
     local nf = {}
-    for i = hi, ti do nf[#nf + 1] = { t = fr[i].t - off, cf = fr[i].cf, p = fr[i].p } end
+    for i = hi, ti do
+        nf[#nf + 1] = { t = fr[i].t - off, cf = fr[i].cf, p = fr[i].p }
+    end
     D.frames = nf
     D.marks = {}
+    D.bounds = nil
+    S.tcKey = nil
+    S.tcH = nil
+    S.tcT = nil
+    S.mapKey = nil
+
     rebuildTrail()
     rebuildMk()
-    resetTrimValues()
+
+    S.tr.h, S.tr.t, S.tr.hs, S.tr.ts = 0, 0, 0, 0
+    S.tcKey = nil
+    UI.SetValue("r_trim_h", 0)
+    UI.SetValue("r_trim_t", 0)
+    UI.SetValue("r_trim_hs", 0)
+    UI.SetValue("r_trim_ts", 0)
+
     notify(string.format("Trim: %d -> %d", n0, #nf), "Recorder", 2)
 end
 
