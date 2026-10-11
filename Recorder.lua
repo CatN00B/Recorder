@@ -25,21 +25,23 @@ for i = 1, 100 do
 end
 
 local S = {
-    rec = false, play = false, loop_ = false, ghost = false,
+    rec = false, play = false, loop_ = false, ghost = false, scrub = false,
     pEl = 0, gEl = 0, pIdx = 1, gIdx = 1,
     t0 = 0, lastT = tick(), drawn = 0,
     lastCfT = 0, frameGaps = 0, overflow = false,
-    vtick = 0, phase = 0, stamp = 0,
+    vtick = 0, phase = 0, stamp = 0, thr = 2, fxT = 0, fxPh = 0,
+    pAcc = 0, pv = 0,
     colorVer = 1, rcVer = 0,
     hudShown = false, hudKey = nil, gKey = nil, bKey = nil, cached = {},
     mapShown = false, mapKey = nil, trimShown = false, trimCV = -1,
     trailShown = false,
-    dTrail = false, dMap = false, dTicks = false, dMk = false,
+    dTrail = false,
     tr = {h = 0, t = 0, hs = 0, ts = 0},
     tcKey = nil, tcH = nil, tcT = nil,
     prevKeys = {},
     fileCombo = nil,
     lastCf = nil,
+    scrubV = 0,
 }
 
 local C = {
@@ -48,9 +50,13 @@ local C = {
     mapSize = 180, mapX = 0, mapY = 0, mapAlpha = 0.55,
     hudX = 20, hudY = 20, hudScale = 1.0, hudAlpha = 0.5, hudCorner = 6, hudFont = 5,
     trimPreview = true, heat = false, liveTrail = false, smoothTrail = true,
+    fxOn = true, fx = 1, fxSpeed = 1.0, trailW = 2,
+    pOn = true, pType = 0, pCol = 3, pRate = 40, pSize = 2.0, pLife = 1.0, pSpread = 1.0, pMax = 200,
     ghostColor = {r = 255, g = 120, b = 255, a = 0.9},
     accentColor = {r = 120, g = 220, b = 180, a = 1},
     pathColor = {r = 120, g = 220, b = 180, a = 1},
+    gradColor = {r = 255, g = 80, b = 200, a = 1},
+    pColor = {r = 255, g = 200, b = 80, a = 1},
     headColor = {r = 255, g = 60, b = 60, a = 1},
     tailColor = {r = 60, g = 180, b = 255, a = 1},
     trimColor = {r = 255, g = 140, b = 40, a = 0.9},
@@ -58,9 +64,21 @@ local C = {
 
 local K = {
     MAX_SEGS = 800, MIN_DIST = 0.1, MAX_FRAMES = 18000, LIVE_BATCH = 4,
-    GRAPH_PTS = 60, HROWS = 6, HEAT_BANDS = 6,
+    GRAPH_PTS = 60, HROWS = 6, POOL_CAP = 1200, CPOOL_CAP = 600,
     FOLDER = "recorder", CFG = "recorder_config.json",
     VK_R = 82, VK_P = 80, VK_L = 76, VK_G = 71,
+    FXN = {"Solid", "Comet", "Rainbow", "Pulse", "Fire", "Ice", "Gradient", "Dashed", "Neon", "Sparkle", "Speed Width"},
+    FXA = {[2] = true, [3] = true, [4] = true, [5] = true, [9] = true},
+    FXHZ = 12, FXCYC = 36,
+    PN = {"Embers", "Stardust", "Bubbles", "Snow"},
+    PCN = {"Path", "Accent", "Rainbow", "Fire", "Ice", "White", "Gradient", "Custom"},
+    PDYN = {[2] = true, [3] = true, [4] = true, [6] = true},
+    PT = {
+        {kind = 2, grav = 4, sp = 2.2, up = 3.5, vyk = 0.4, drag = 0.7, life = 1.6, filled = true},
+        {kind = 2, grav = 0, sp = 3.5, up = 0, vyk = 1, drag = 1.4, life = 1.8, filled = true, twinkle = true},
+        {kind = 2, grav = 5, sp = 1.2, up = 2, vyk = 0.4, drag = 1.2, life = 2.0, filled = false},
+        {kind = 2, grav = -2.5, sp = 2.5, up = 1, vyk = 0.2, drag = 1.0, life = 2.4, filled = true, sway = true},
+    },
     FONTS = {
         Drawing.Fonts.UI, Drawing.Fonts.System, Drawing.Fonts.SystemBold, Drawing.Fonts.Minecraft,
         Drawing.Fonts.Monospace, Drawing.Fonts.Pixel, Drawing.Fonts.Fortnite, Drawing.Fonts.ProximaSoftBold,
@@ -74,6 +92,12 @@ local K = {
     DIM = Color3.fromRGB(120, 120, 130),
     WARN = Color3.fromRGB(255, 180, 90),
     REC = Color3.fromRGB(255, 90, 90),
+    WHITE = Color3.fromRGB(255, 255, 255),
+    FR = Color3.fromRGB(255, 40, 0),
+    FO = Color3.fromRGB(255, 140, 0),
+    FY = Color3.fromRGB(255, 230, 80),
+    IB = Color3.fromRGB(50, 130, 255),
+    IW = Color3.fromRGB(210, 248, 255),
 }
 
 for i = 0, 7 do
@@ -84,102 +108,82 @@ end
 
 local D = {
     frames = {}, spd = {}, spdS = {}, stat = {dist = 0, maxV = 0, minV = math.huge},
-    marks = {}, trail = {}, mapSegs = {}, mk = {},
+    marks = {}, trail = {}, mapSegs = {},
     graphSegs = {}, files = {}, bounds = nil,
 }
 
-local DR = { hud = {}, map = {}, trim = {}, ghost = {} }
+local DR = { hud = {}, map = {}, trim = {}, ghost = nil }
 local RC = {}
 local PC = { v = {}, o = {}, s = {} }
+local PL = { free = {}, n = 0 }
+local PCp = { free = {}, n = 0 }
+local PS = { list = {}, eT = 0, eH = 0, hx = 0, hy = 0, hz = 0, hv = false }
 
 local function refreshColors()
-    RC.accent = {c = Color3.fromRGB(C.accentColor.r, C.accentColor.g, C.accentColor.b), a = C.accentColor.a}
-    RC.path = {c = Color3.fromRGB(C.pathColor.r, C.pathColor.g, C.pathColor.b), a = C.pathColor.a}
-    RC.head = {c = Color3.fromRGB(C.headColor.r, C.headColor.g, C.headColor.b), a = C.headColor.a}
-    RC.tail = {c = Color3.fromRGB(C.tailColor.r, C.tailColor.g, C.tailColor.b), a = C.tailColor.a}
-    RC.trim = {c = Color3.fromRGB(C.trimColor.r, C.trimColor.g, C.trimColor.b), a = C.trimColor.a}
-    RC.ghost = {c = Color3.fromRGB(C.ghostColor.r, C.ghostColor.g, C.ghostColor.b), a = C.ghostColor.a}
+    local function mk(t) return {c = Color3.fromRGB(t.r, t.g, t.b), a = t.a} end
+    RC.accent = mk(C.accentColor)
+    RC.path = mk(C.pathColor)
+    RC.grad = mk(C.gradColor)
+    RC.pcol = mk(C.pColor)
+    RC.head = mk(C.headColor)
+    RC.tail = mk(C.tailColor)
+    RC.trim = mk(C.trimColor)
+    RC.ghost = mk(C.ghostColor)
     S.rcVer = S.colorVer
 end
 refreshColors()
 
-local resetTrimValues
-
-local function setGhost(v)
-    if S.ghost == v then return end
-    if v then
-        if #D.frames < 2 then
-            notify("No recording", "Recorder", 2)
-            UI.SetValue("r_ghost", false)
-            return
-        end
-        if S.play then
-            notify("Stop playback first", "Recorder", 2)
-            UI.SetValue("r_ghost", false)
-            return
-        end
-        if S.rec then
-            notify("Stop recording first", "Recorder", 2)
-            UI.SetValue("r_ghost", false)
-            return
-        end
-        S.ghost = true
-        S.gEl = 0
-        S.gIdx = 1
+local function acquireLine(z)
+    local n = PL.n
+    local l
+    if n > 0 then
+        l = PL.free[n]
+        PL.free[n] = nil
+        PL.n = n - 1
+        l.ZIndex = z
     else
-        S.ghost = false
-        if S.gShown then
-            S.gShown = false
-            for i = 1, 13 do DR.ghost.l[i].Visible = false end
-        end
+        l = Drawing.new("Line")
+        l.ZIndex = z
     end
-    UI.SetValue("r_ghost", v)
+    l.Thickness = 2
+    l.Visible = false
+    return l
 end
 
-local function setLoop(v)
-    if S.loop_ == v then return end
-    S.loop_ = v
-    UI.SetValue("r_loop", v)
-end
-
-local function heatCol(v)
-    local st = D.stat
-    local rng = st.maxV - st.minV
-    if rng <= 0 then rng = 1 end
-    local t = math.clamp((v - st.minV) / rng, 0, 1)
-    local bands = K.BANDS
-    local nb = #bands
-    if C.smoothTrail then
-        return bands[math.floor(t * (nb - 1) + 0.5) + 1]
+local function releaseLine(l)
+    pcall(function() l.Visible = false end)
+    if PL.n < K.POOL_CAP then
+        PL.n = PL.n + 1
+        PL.free[PL.n] = l
+    else
+        pcall(function() l:Remove() end)
     end
-    local seg = 1 / (nb - 1)
-    local idx = math.min(math.floor(t / seg) + 1, nb - 1)
-    local lt = (t - (idx - 1) * seg) / seg
-    local c1, c2 = bands[idx], bands[idx + 1]
-    return Color3.new(c1.R + (c2.R - c1.R) * lt, c1.G + (c2.G - c1.G) * lt, c1.B + (c2.B - c1.B) * lt)
 end
 
-local function catmullRomV3(a, b, c, d, t)
-    local t2 = t * t
-    local t3 = t2 * t
-    return Vector3.new(
-        0.5 * ((2 * b.X) + (-a.X + c.X) * t + (2 * a.X - 5 * b.X + 4 * c.X - d.X) * t2 + (-a.X + 3 * b.X - 3 * c.X + d.X) * t3),
-        0.5 * ((2 * b.Y) + (-a.Y + c.Y) * t + (2 * a.Y - 5 * b.Y + 4 * c.Y - d.Y) * t2 + (-a.Y + 3 * b.Y - 3 * c.Y + d.Y) * t3),
-        0.5 * ((2 * b.Z) + (-a.Z + c.Z) * t + (2 * a.Z - 5 * b.Z + 4 * c.Z - d.Z) * t2 + (-a.Z + 3 * b.Z - 3 * c.Z + d.Z) * t3)
-    )
+local function acquireCircle(z)
+    local n = PCp.n
+    local c
+    if n > 0 then
+        c = PCp.free[n]
+        PCp.free[n] = nil
+        PCp.n = n - 1
+        c.ZIndex = z
+    else
+        c = Drawing.new("Circle")
+        c.NumSides, c.ZIndex = 12, z
+    end
+    c.Transparency, c.Visible = 1, false
+    return c
 end
 
-local function hrp()
-    local c = LP.Character
-    return c and c:FindFirstChild("HumanoidRootPart")
-end
-
-local function ensureFolder()
-    if not isfolder(K.FOLDER) then pcall(makefolder, K.FOLDER) end
-end
-
-local function rpath(n)
-    return K.FOLDER .. "/" .. n .. ".json"
+local function releaseCircle(c)
+    pcall(function() c.Visible = false end)
+    if PCp.n < K.CPOOL_CAP then
+        PCp.n = PCp.n + 1
+        PCp.free[PCp.n] = c
+    else
+        pcall(function() c:Remove() end)
+    end
 end
 
 local function mkLine(z)
@@ -214,6 +218,197 @@ local function mkDot(sides, radius, z, color)
     return c
 end
 
+local function mkGhost(z)
+    local G = {l = {}, sp = {}, so = {}, cv = -1, shown = false}
+    for i = 1, 13 do
+        local l = Drawing.new("Line")
+        l.Thickness = i == 13 and 2.5 or 1.5
+        l.ZIndex, l.Visible = z, false
+        G.l[i] = l
+    end
+    return G
+end
+
+local function initDraw()
+    local font = K.FONTS[C.hudFont] or K.FONTS[5]
+    local H = DR.hud
+    H.bg = mkSquare(Color3.fromRGB(12, 12, 18), 0.5, 6, 900)
+    H.border = mkSquare(Color3.fromRGB(255, 255, 255), 0.85, 6, 901)
+    H.border.Filled = false
+    H.border.Thickness = 1
+    H.title = mkText(14, font, Color3.fromRGB(255, 255, 255))
+    H.title.Text = "RECORDER"
+    H.rows = {}
+    for i = 1, K.HROWS do H.rows[i] = mkText(13, font, Color3.fromRGB(200, 200, 200)) end
+    H.gbg = mkSquare(Color3.fromRGB(20, 20, 28), 0.5, 0, 902)
+    H.bbg = mkSquare(Color3.fromRGB(38, 38, 48), 1, 0, 902)
+    H.bfill = mkSquare(Color3.fromRGB(120, 220, 180), 1, 0, 903)
+    H.btext = mkText(12, font, Color3.fromRGB(220, 255, 235))
+
+    local M = DR.map
+    M.bg = mkSquare(Color3.fromRGB(10, 12, 16), 0.55, 6, 900)
+    M.border = mkSquare(Color3.fromRGB(255, 255, 255), 0.85, 6, 901)
+    M.border.Filled = false
+    M.border.Thickness = 1
+    M.title = mkText(12, K.FONTS[3] or font, Color3.fromRGB(255, 255, 255))
+    M.title.Text = "ROUTE"
+    M.s = mkDot(12, 4, 904, Color3.fromRGB(90, 255, 130))
+    M.e = mkDot(12, 4, 904, Color3.fromRGB(255, 90, 90))
+    M.c = mkDot(14, 4.5, 905, Color3.fromRGB(255, 255, 255))
+
+    local T = DR.trim
+    T.hSq, T.hX1, T.hX2 = mkSq(520), mkLine(520), mkLine(520)
+    T.tSq, T.tX1, T.tX2 = mkSq(520), mkLine(520), mkLine(520)
+    T.hC = mkDot(10, 5, 907)
+    T.tS = Drawing.new("Square")
+    T.tS.Filled, T.tS.ZIndex, T.tS.Visible = true, 907, false
+
+    DR.ghost = mkGhost(600)
+end
+initDraw()
+
+local function hideGhost(G)
+    if not G.shown then return end
+    G.shown = false
+    for i = 1, 13 do G.l[i].Visible = false end
+end
+
+local setPlay
+local resetTrimValues
+
+local function setGhost(v)
+    if S.ghost == v then return end
+    if v then
+        if #D.frames < 2 then
+            notify("No recording", "Recorder", 2)
+            UI.SetValue("r_ghost", false)
+            return
+        end
+        if S.play then
+            notify("Stop playback first", "Recorder", 2)
+            UI.SetValue("r_ghost", false)
+            return
+        end
+        if S.rec then
+            notify("Stop recording first", "Recorder", 2)
+            UI.SetValue("r_ghost", false)
+            return
+        end
+        S.ghost = true
+        S.gEl = 0
+        S.gIdx = 1
+    else
+        S.ghost = false
+        if S.scrub then
+            S.scrub = false
+            UI.SetValue("r_scrub_on", false)
+        end
+        hideGhost(DR.ghost)
+    end
+    UI.SetValue("r_ghost", v)
+end
+
+local function setScrub(v)
+    if S.scrub == v then return end
+    S.scrub = v
+    if v and not S.ghost then
+        setGhost(true)
+        if not S.ghost then
+            S.scrub = false
+            UI.SetValue("r_scrub_on", false)
+        end
+    end
+end
+
+local function setLoop(v)
+    if S.loop_ == v then return end
+    S.loop_ = v
+    UI.SetValue("r_loop", v)
+end
+
+local function heatCol(v)
+    local st = D.stat
+    local rng = st.maxV - st.minV
+    if rng <= 0 then rng = 1 end
+    local t = math.clamp((v - st.minV) / rng, 0, 1)
+    local bands = K.BANDS
+    local nb = #bands
+    if C.smoothTrail then
+        return bands[math.floor(t * (nb - 1) + 0.5) + 1]
+    end
+    local seg = 1 / (nb - 1)
+    local idx = math.min(math.floor(t / seg) + 1, nb - 1)
+    local lt = (t - (idx - 1) * seg) / seg
+    local c1, c2 = bands[idx], bands[idx + 1]
+    return Color3.new(c1.R + (c2.R - c1.R) * lt, c1.G + (c2.G - c1.G) * lt, c1.B + (c2.B - c1.B) * lt)
+end
+
+local function mixC(a, b, k)
+    return Color3.new(a.R + (b.R - a.R) * k, a.G + (b.G - a.G) * k, a.B + (b.B - a.B) * k)
+end
+
+local function hue(h)
+    local r = math.clamp(math.abs(h * 6 - 3) - 1, 0, 1)
+    local g = math.clamp(2 - math.abs(h * 6 - 2), 0, 1)
+    local b = math.clamp(2 - math.abs(h * 6 - 4), 0, 1)
+    return Color3.new(0.15 + r * 0.85, 0.15 + g * 0.85, 0.15 + b * 0.85)
+end
+
+local function fxApply(fx, i, nT, e, c, a, ph)
+    local t = i / nT
+    local p = ph / K.FXCYC
+    if fx == 2 then
+        return hue((t * 0.8 + p) % 1), a, 0
+    elseif fx == 3 then
+        local k = 0.5 + 0.5 * math.sin(6.2832 * (t * 3 - p))
+        return mixC(c, K.WHITE, k * 0.75), a * (0.55 + 0.45 * k), 0
+    elseif fx == 4 then
+        local k = (0.5 + 0.5 * math.sin(6.2832 * (t * 7 - p * 3))) * 0.6 + (0.5 + 0.5 * math.sin(6.2832 * (t * 2.3 + p))) * 0.4
+        local col
+        if k < 0.5 then col = mixC(K.FR, K.FO, k * 2) else col = mixC(K.FO, K.FY, (k - 0.5) * 2) end
+        return col, a * (0.55 + 0.45 * k), 0
+    elseif fx == 5 then
+        local k = 0.5 + 0.5 * math.sin(6.2832 * (t * 4 - p))
+        return mixC(K.IB, K.IW, k), a * (0.6 + 0.4 * k), 0
+    elseif fx == 6 then
+        local g = RC.grad
+        return mixC(c, g.c, t), a + (g.a - a) * t, 0
+    elseif fx == 8 then
+        return mixC(c, K.WHITE, 0.45), a, 0
+    elseif fx == 9 then
+        if (i * 7919 + ph * 104729) % 101 < 5 then return K.WHITE, 1, 1 end
+        return c, a, 0
+    elseif fx == 10 then
+        local mx = D.stat.maxV
+        if mx < 1 then mx = 1 end
+        return c, a, math.floor((D.spd[e.i] or 0) / mx * 3 + 0.5)
+    end
+    return c, a, 0
+end
+
+local function catmullRomV3(a, b, c, d, t)
+    local t2 = t * t
+    local t3 = t2 * t
+    return Vector3.new(
+        0.5 * ((2 * b.X) + (-a.X + c.X) * t + (2 * a.X - 5 * b.X + 4 * c.X - d.X) * t2 + (-a.X + 3 * b.X - 3 * c.X + d.X) * t3),
+        0.5 * ((2 * b.Y) + (-a.Y + c.Y) * t + (2 * a.Y - 5 * b.Y + 4 * c.Y - d.Y) * t2 + (-a.Y + 3 * b.Y - 3 * c.Y + d.Y) * t3),
+        0.5 * ((2 * b.Z) + (-a.Z + c.Z) * t + (2 * a.Z - 5 * b.Z + 4 * c.Z - d.Z) * t2 + (-a.Z + 3 * b.Z - 3 * c.Z + d.Z) * t3)
+    )
+end
+
+local function hrp()
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function ensureFolder()
+    if not isfolder(K.FOLDER) then pcall(makefolder, K.FOLDER) end
+end
+
+local function rpath(n)
+    return K.FOLDER .. "/" .. n .. ".json"
+end
+
 local function findIdx(tbl, t)
     local lo, hi = 1, #tbl
     while lo < hi do
@@ -223,8 +418,7 @@ local function findIdx(tbl, t)
     return lo
 end
 
-local function splineCf(idx, alpha)
-    local fr = D.frames
+local function splineCf(fr, idx, alpha)
     local n = #fr
     if n < 4 then return nil end
     if idx - 1 < 1 or idx + 2 > n then return nil end
@@ -233,8 +427,7 @@ local function splineCf(idx, alpha)
     return CFrame.new(pos.X, pos.Y, pos.Z, r00, r01, r02, r10, r11, r12, r20, r21, r22)
 end
 
-local function sampleCf(t)
-    local fr = D.frames
+local function sampleCf(fr, t)
     local n = #fr
     if n == 0 then return nil, 1 end
     if n == 1 or t <= fr[1].t then return fr[1].cf, 1 end
@@ -243,7 +436,7 @@ local function sampleCf(t)
     local a, b = fr[i], fr[i + 1]
     local seg = b.t - a.t
     local al = seg > 0 and (t - a.t) / seg or 0
-    local c = splineCf(i, al)
+    local c = splineCf(fr, i, al)
     if c then return c, i end
     return a.cf:Lerp(b.cf, al), i
 end
@@ -253,6 +446,17 @@ local function proj(i)
     local v, o = WorldToScreen(D.frames[i].p)
     PC.v[i], PC.o[i], PC.s[i] = v, o, S.stamp
     return v, o
+end
+
+local function trailPos(fi)
+    local tr = D.trail
+    local lo, hi = 1, #tr
+    if hi == 0 then return 0 end
+    while lo < hi do
+        local mid = math.floor((lo + hi + 1) / 2)
+        if tr[mid].i <= fi then lo = mid else hi = mid - 1 end
+    end
+    return lo
 end
 
 local function computeTrimIndices()
@@ -344,22 +548,22 @@ local function segColor(i, prev)
     return c
 end
 
-local function addSeg(i, step, lastColor, n)
+local function addSeg(i, j, lastColor)
     local fr = D.frames
-    if i <= 1 or i > #fr then return lastColor end
-    local j = math.max(1, i - step)
+    if i <= 1 or i > #fr or j < 1 then return lastColor end
     local a, b = fr[j].p, fr[i].p
     if (a - b).Magnitude < K.MIN_DIST then return lastColor end
-    local l = mkLine(500)
     local hc = segColor(i, lastColor)
-    D.trail[#D.trail + 1] = { l = l, i = i, j = j, hc = hc }
+    D.trail[#D.trail + 1] = { l = acquireLine(500), i = i, j = j, hc = hc, x = b.X, y = b.Y, z = b.Z }
     return hc
 end
 
 local function clearTrail()
     local tr = D.trail
     for i = #tr, 1, -1 do
-        pcall(function() tr[i].l:Remove() end)
+        local e = tr[i]
+        releaseLine(e.l)
+        if e.g then releaseLine(e.g) end
         tr[i] = nil
     end
     S.drawn = 0
@@ -374,8 +578,12 @@ local function rebuildTrail()
     local n = #D.frames
     if n < 2 then return end
     local step = stepFor(n)
-    local lastColor = nil
-    for i = step + 1, n, step do lastColor = addSeg(i, step, lastColor, n) end
+    local lastColor, lastI = nil, 1
+    for i = step + 1, n, step do
+        lastColor = addSeg(i, i - step, lastColor)
+        lastI = i
+    end
+    if lastI < n then addSeg(n, lastI, lastColor) end
     S.drawn = n
 end
 
@@ -409,13 +617,8 @@ end
 local function clearMap()
     local ms = D.mapSegs
     for i = #ms, 1, -1 do
-        pcall(function() ms[i].l:Remove() end)
+        releaseLine(ms[i].l)
         ms[i] = nil
-    end
-    local mm = D.mk
-    for i = #mm, 1, -1 do
-        pcall(function() mm[i].c:Remove() end)
-        mm[i] = nil
     end
     S.mapKey = nil
 end
@@ -426,82 +629,29 @@ local function rebuildMap()
     local n = #D.frames
     if not D.bounds or n < 2 then return end
     local step = stepFor(n)
+    local lastI = 1
     for i = step + 1, n, step do
-        D.mapSegs[#D.mapSegs + 1] = { l = mkLine(902), i = i, j = i - step }
+        D.mapSegs[#D.mapSegs + 1] = { l = acquireLine(902), i = i, j = i - step }
+        lastI = i
     end
-    for i, m in ipairs(D.marks) do
-        D.mk[i] = { c = mkDot(10, 3.5, 906), p = m.p }
-    end
-end
-
-local function rebuildMk()
-    rebuildMap()
-end
-
-local function initDraw()
-    local H = DR.hud
-    H.bg = mkSquare(Color3.fromRGB(12, 12, 18), 0.5, 6, 900)
-    H.border = mkSquare(Color3.fromRGB(255, 255, 255), 0.85, 6, 901)
-    H.border.Filled = false
-    H.border.Thickness = 1
-    H.title = mkText(14, K.FONTS[C.hudFont], Color3.fromRGB(255, 255, 255))
-    H.title.Text = "RECORDER"
-    H.rows = {}
-    for i = 1, K.HROWS do H.rows[i] = mkText(13, K.FONTS[C.hudFont], Color3.fromRGB(200, 200, 200)) end
-    H.gbg = mkSquare(Color3.fromRGB(20, 20, 28), 0.5, 0, 902)
-    H.bbg = mkSquare(Color3.fromRGB(38, 38, 48), 1, 0, 902)
-    H.bfill = mkSquare(Color3.fromRGB(120, 220, 180), 1, 0, 903)
-    H.btext = mkText(12, K.FONTS[C.hudFont], Color3.fromRGB(220, 255, 235))
-
-    local M = DR.map
-    M.bg = mkSquare(Color3.fromRGB(10, 12, 16), 0.55, 6, 900)
-    M.border = mkSquare(Color3.fromRGB(255, 255, 255), 0.85, 6, 901)
-    M.border.Filled = false
-    M.border.Thickness = 1
-    M.title = mkText(12, K.FONTS[3], Color3.fromRGB(255, 255, 255))
-    M.title.Text = "ROUTE"
-    M.s = mkDot(12, 4, 904, Color3.fromRGB(90, 255, 130))
-    M.e = mkDot(12, 4, 904, Color3.fromRGB(255, 90, 90))
-    M.c = mkDot(14, 4.5, 905, Color3.fromRGB(255, 255, 255))
-
-    local T = DR.trim
-    T.hSq, T.hX1, T.hX2 = mkSq(520), mkLine(520), mkLine(520)
-    T.tSq, T.tX1, T.tX2 = mkSq(520), mkLine(520), mkLine(520)
-    T.hC = mkDot(10, 5, 907)
-    T.tS = Drawing.new("Square")
-    T.tS.Filled, T.tS.ZIndex, T.tS.Visible = true, 907, false
-
-    local G = DR.ghost
-    G.l, G.sp, G.so, G.cv = {}, {}, {}, -1
-    for i = 1, 13 do
-        local l = Drawing.new("Line")
-        l.Thickness = i == 13 and 2.5 or 1.5
-        l.ZIndex, l.Visible = 600, false
-        G.l[i] = l
+    if lastI < n then
+        D.mapSegs[#D.mapSegs + 1] = { l = acquireLine(902), i = n, j = lastI }
     end
 end
 
-initDraw()
-
-local function hideGhost()
-    if not S.gShown then return end
-    S.gShown = false
-    for i = 1, 13 do DR.ghost.l[i].Visible = false end
-end
-
-local function showGhost(cf)
-    local G = DR.ghost
+local function showGhost(G, cf)
     if G.cv ~= S.colorVer then
         local g = RC.ghost
-        for i = 1, 13 do G.l[i].Color, G.l[i].Transparency = g.c, g.a end
+        for i = 1, 13 do
+            local l = G.l[i]
+            l.Color, l.Transparency = g.c, g.a
+        end
         G.cv = S.colorVer
     end
     local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cf:GetComponents()
-    local gw = 1.5
-    local gh = 3
     local sp, so = G.sp, G.so
     for i = 1, 8 do
-        local sx, sy, sz = K.SX[i] * gw, K.SY[i] * gh, K.SZ[i] * gw
+        local sx, sy, sz = K.SX[i] * 1.5, K.SY[i] * 3, K.SZ[i] * 1.5
         sp[i], so[i] = WorldToScreen(Vector3.new(
             px + r00 * sx + r01 * sy + r02 * sz,
             py + r10 * sx + r11 * sy + r12 * sz,
@@ -525,7 +675,7 @@ local function showGhost(cf)
     else
         al.Visible = false
     end
-    S.gShown = true
+    G.shown = true
 end
 
 local function hideTrim()
@@ -609,11 +759,13 @@ end
 local function updatePath()
     local tr = D.trail
     local nT = #tr
+    local fx = C.fxOn and C.fx or 0
     if not C.showPath or nT == 0 then
         if S.trailShown then
             for i = 1, nT do
                 local e = tr[i]
                 if e.on then e.l.Visible, e.on = false, false end
+                if e.g then e.g.Visible, e.gon = false, false end
             end
             S.trailShown = false
         end
@@ -625,36 +777,299 @@ local function updatePath()
     if C.trimPreview then headIdx, tailIdx = computeTrimIndices() end
     local P, T = RC.path, RC.trim
     local colorVer = S.colorVer
+    local ph = S.fxPh
+    local tw = C.trailW
+    local animated = K.FXA[fx]
+    local dashOff = math.floor(ph / 3)
+    local flowOn = fx == 1
+    local head, wrap, W = 0, false, 1
+    if flowOn then
+        W = math.max(4, math.min(16, math.floor(nT * 0.08)))
+        if S.play then
+            head = trailPos(S.pIdx)
+        elseif S.ghost then
+            head = trailPos(S.gIdx)
+        else
+            head = math.floor((S.fxT % 2.5) / 2.5 * nT)
+            wrap = true
+        end
+    end
     for i = 1, nT do
         local e = tr[i]
         local a2, aOn = proj(e.j)
         local b2, bOn
         if aOn then b2, bOn = proj(e.i) end
         if aOn and bOn then
-            local ax, ay, bx, by = a2.X, a2.Y, b2.X, b2.Y
-            if not e.on or e.ax ~= ax or e.ay ~= ay or e.bx ~= bx or e.by ~= by then
-                e.l.From, e.l.To = a2, b2
-                e.ax, e.ay, e.bx, e.by = ax, ay, bx, by
-            end
-            if not e.on then e.l.Visible, e.on = true, true end
             local state
             if headIdx and (e.i <= headIdx or e.j > tailIdx) then state = 1
             elseif C.heat then state = 2
             else state = 0 end
-            if e.cs ~= state or e.cv ~= colorVer then
-                local c, a
-                if state == 1 then
-                    c, a = T.c, T.a
-                elseif state == 2 then
-                    c, a = e.hc, P.a
-                else
-                    c, a = P.c, P.a
+            local fxOn = state ~= 1
+            if fx == 7 and fxOn and ((i - dashOff) % 4) >= 2 then
+                if e.on then e.l.Visible, e.on = false, false end
+                if e.g then
+                    releaseLine(e.g)
+                    e.g, e.gon = nil, false
                 end
-                e.l.Color, e.l.Transparency = c, a
-                e.cs, e.cv = state, colorVer
+            else
+                local ax, ay, bx, by = a2.X, a2.Y, b2.X, b2.Y
+                local moved = not e.on or e.ax ~= ax or e.ay ~= ay or e.bx ~= bx or e.by ~= by
+                if moved then
+                    e.l.From, e.l.To = a2, b2
+                    e.ax, e.ay, e.bx, e.by = ax, ay, bx, by
+                end
+                if not e.on then e.l.Visible, e.on = true, true end
+                if fx == 8 and fxOn then
+                    if not e.g then
+                        e.g = acquireLine(499)
+                        e.gon = false
+                        e.cs = nil
+                        moved = true
+                    end
+                    if moved then e.g.From, e.g.To = a2, b2 end
+                    if not e.gon then e.g.Visible, e.gon = true, true end
+                elseif e.g then
+                    releaseLine(e.g)
+                    e.g, e.gon = nil, false
+                end
+                local pb = 0
+                if flowOn and fxOn then
+                    local k = head - i
+                    if wrap and k < 0 then k = k + nT end
+                    if k >= 0 and k < W then pb = 4 - math.floor(k * 4 / W) end
+                end
+                local ak = (fxOn and animated) and (ph + 1) or 0
+                local key = state + pb * 100 + ak * 1000
+                if e.cs ~= key or e.cv ~= colorVer then
+                    local c, a
+                    if state == 1 then
+                        c, a = T.c, T.a
+                    elseif state == 2 then
+                        c, a = e.hc, P.a
+                    else
+                        c, a = P.c, P.a
+                    end
+                    local c0, xt = c, 0
+                    if fxOn and fx >= 2 then c, a, xt = fxApply(fx, i, nT, e, c, a, ph) end
+                    if pb > 0 then
+                        local m = pb * 0.2
+                        c = Color3.new(c.R + (1 - c.R) * m, c.G + (1 - c.G) * m, c.B + (1 - c.B) * m)
+                    end
+                    local th = tw + xt
+                    if e.th ~= th then e.l.Thickness, e.th = th, th end
+                    e.l.Color, e.l.Transparency = c, a
+                    if e.g then
+                        e.g.Thickness = th + 5
+                        e.g.Color, e.g.Transparency = c0, a * 0.3
+                    end
+                    e.cs, e.cv = key, colorVer
+                end
             end
-        elseif e.on then
-            e.l.Visible, e.on = false, false
+        elseif e.on or e.g then
+            if e.on then e.l.Visible, e.on = false, false end
+            if e.g then
+                if fx ~= 8 then
+                    releaseLine(e.g)
+                    e.g = nil
+                else
+                    e.g.Visible = false
+                end
+                e.gon = false
+            end
+        end
+    end
+end
+
+local function killP(i)
+    local list = PS.list
+    local p = list[i]
+    releaseCircle(p.o)
+    local n = #list
+    list[i] = list[n]
+    list[n] = nil
+end
+
+local function clearParticles()
+    local list = PS.list
+    for i = #list, 1, -1 do
+        local p = list[i]
+        releaseCircle(p.o)
+        list[i] = nil
+    end
+    PS.eT, PS.eH, PS.hv = 0, 0, false
+    S.pAcc = 0
+end
+
+local function pColor(p, k)
+    local m = C.pCol
+    if m == 0 then return RC.path.c end
+    if m == 1 then return RC.accent.c end
+    if m == 2 then return hue((p.seed + k * 0.6) % 1) end
+    if m == 3 then
+        if k < 0.5 then return mixC(K.FY, K.FO, k * 2) end
+        return mixC(K.FO, K.FR, (k - 0.5) * 2)
+    end
+    if m == 4 then return mixC(K.IW, K.IB, k) end
+    if m == 5 then return K.WHITE end
+    if m == 6 then return mixC(RC.path.c, RC.grad.c, k) end
+    return RC.pcol.c
+end
+
+local function emitOne(x, y, z, bx, by, bz, sm)
+    local T = K.PT[C.pType + 1]
+    local u = math.random() * 2 - 1
+    local th = math.random() * 6.2832
+    local s = math.sqrt(1 - u * u)
+    local sp = T.sp * C.pSpread * sm * (0.35 + 0.65 * math.random())
+    local o = acquireCircle(520)
+    o.Filled = T.filled
+    o.Thickness = 1
+    local list = PS.list
+    list[#list + 1] = {
+        o = o, kind = 2,
+        x = x + (math.random() - 0.5) * 0.5, y = y + (math.random() - 0.5) * 0.5, z = z + (math.random() - 0.5) * 0.5,
+        vx = s * math.cos(th) * sp + bx,
+        vy = u * sp * T.vyk + T.up * (0.5 + math.random()) * sm + by,
+        vz = s * math.sin(th) * sp + bz,
+        age = 0, life = C.pLife * T.life * (0.6 + 0.4 * math.random()),
+        size = C.pSize * (0.6 + 0.8 * math.random()),
+        seed = math.random(), on = false, has = false, sx = 0, sy = 0,
+    }
+end
+
+local function headPos()
+    if S.play or S.rec then
+        local h = hrp()
+        if h then
+            local p = h.Position
+            return p.X, p.Y, p.Z
+        end
+    elseif S.ghost then
+        local cf = sampleCf(D.frames, S.gEl)
+        if cf then
+            local p = cf.Position
+            return p.X, p.Y, p.Z
+        end
+    end
+    return nil
+end
+
+local function trailPt()
+    local tr = D.trail
+    local nT = #tr
+    if nT == 0 then return nil end
+    for q = 1, 3 do
+        local e = tr[math.random(nT)]
+        if e.on then return e.x, e.y, e.z end
+    end
+    return nil
+end
+
+local function updateParticles(dt)
+    local list = PS.list
+    if not C.pOn then
+        if #list > 0 then clearParticles() end
+        return
+    end
+    if dt > 0.1 then dt = 0.1 elseif dt < 0.001 then dt = 0.001 end
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local cp = cam.CFrame.Position
+    local T = K.PT[C.pType + 1]
+
+    local hx, hy, hz = headPos()
+    local bx, by, bz = 0, 0, 0
+    if hx then
+        if PS.hv then
+            local vx, vy, vz = (hx - PS.hx) / dt, (hy - PS.hy) / dt, (hz - PS.hz) / dt
+            local m = math.sqrt(vx * vx + vy * vy + vz * vz)
+            local f = -0.25
+            if m > 40 then f = f * 40 / m end
+            bx, by, bz = vx * f, vy * f, vz * f
+        end
+        PS.hx, PS.hy, PS.hz, PS.hv = hx, hy, hz, true
+    else
+        PS.hv = false
+    end
+
+    while #list > C.pMax do killP(#list) end
+
+    local room = C.pMax - #list
+    if room > 0 then
+        local tr = D.trail
+        if C.showPath and #tr > 0 then PS.eT = PS.eT + C.pRate * dt end
+        if hx then PS.eH = PS.eH + C.pRate * 1.5 * dt end
+        local nt = math.floor(PS.eT)
+        PS.eT = PS.eT - nt
+        if nt > 10 then nt = 10 end
+        for q = 1, nt do
+            if room <= 0 then break end
+            local x, y, z = trailPt()
+            if x then
+                emitOne(x, y, z, 0, 0, 0, 1)
+                room = room - 1
+            end
+        end
+        local nh = math.floor(PS.eH)
+        PS.eH = PS.eH - nh
+        if nh > 10 then nh = 10 end
+        for q = 1, nh do
+            if room <= 0 then break end
+            emitOne(hx, hy, hz, bx, by, bz, 1)
+            room = room - 1
+        end
+    end
+
+    local colorVer = S.colorVer
+    local dyn = K.PDYN[C.pCol]
+    local cx, cy, cz = cp.X, cp.Y, cp.Z
+    local i = 1
+    local n = #list
+    while i <= n do
+        local p = list[i]
+        local age = p.age + dt
+        if age >= p.life then
+            killP(i)
+            n = n - 1
+        else
+            p.age = age
+            local dr = 1 - T.drag * dt
+            if dr < 0 then dr = 0 end
+            local vx, vy, vz = p.vx * dr, p.vy * dr + T.grav * dt, p.vz * dr
+            if T.sway then
+                vx = vx + math.sin(age * 2.3 + p.seed * 6.28) * dt * 2.5
+                vz = vz + math.cos(age * 1.9 + p.seed * 6.28) * dt * 2.5
+            end
+            p.vx, p.vy, p.vz = vx, vy, vz
+            local x, y, z = p.x + vx * dt, p.y + vy * dt, p.z + vz * dt
+            p.x, p.y, p.z = x, y, z
+            local o = p.o
+            local sp, on = WorldToScreen(Vector3.new(x, y, z))
+            if on then
+                local k = age / p.life
+                local a = 1 - k * k
+                if T.twinkle then a = a * (0.55 + 0.45 * math.sin(age * 14 + p.seed * 6.28)) end
+                local ps = 40 / math.sqrt((x - cx) ^ 2 + (y - cy) ^ 2 + (z - cz) ^ 2 + 1)
+                if ps < 0.35 then ps = 0.35 elseif ps > 3 then ps = 3 end
+                local r = p.size * ps
+                if T.filled then r = r * (1 - k * 0.5) else r = r * (0.7 + 0.8 * k) end
+                if r < 0.6 then r = 0.6 end
+                o.Position = sp
+                o.Radius = r
+                local key = (dyn and math.floor(k * 8) or 0) + colorVer * 16
+                if p.ck ~= key then
+                    o.Color = pColor(p, k)
+                    p.ck = key
+                end
+                if not p.ta or math.abs(p.ta - a) > 0.04 then
+                    o.Transparency = a
+                    p.ta = a
+                end
+                if not p.on then o.Visible, p.on = true, true end
+            else
+                if p.on then o.Visible, p.on = false, false end
+            end
+            i = i + 1
         end
     end
 end
@@ -673,7 +1088,8 @@ local function hideHud()
     local H = DR.hud
     H.bg.Visible, H.border.Visible, H.title.Visible = false, false, false
     for _, t in ipairs(H.rows) do t.Visible = false end
-    H.gbg.Visible = false    for _, s in ipairs(D.graphSegs) do s.Visible = false end
+    H.gbg.Visible = false
+    for _, s in ipairs(D.graphSegs) do s.Visible = false end
     H.bbg.Visible, H.bfill.Visible, H.btext.Visible = false, false, false
     S.hudShown, S.hudKey, S.gKey, S.bKey = false, nil, nil, nil
 end
@@ -748,7 +1164,7 @@ local function updateHud()
     local pTxt = "[P] Playing"
     if S.play then pTxt = pTxt .. "  >>" end
     setRow(2, pTxt, S.play and 1 or 0)
-    setRow(3, string.format("Loop %s  Ghost %s", S.loop_ and "on" or "off", S.ghost and "on" or "off"), (S.loop_ or S.ghost) and 1 or 0)
+    setRow(3, string.format("Loop %s  Ghost %s  FX %s", S.loop_ and "on" or "off", S.ghost and (S.scrub and "scrub" or "on") or "off", C.fxOn and K.FXN[C.fx + 1] or "off"), (S.loop_ or S.ghost) and 1 or 0)
     setRow(4, string.format("Frames %d  Time %.1fs", n, dur), n > 0 and 1 or 0)
     local avg = dur > 0 and st.dist / dur or 0
     setRow(5, string.format("Dist %.0f  Avg %.1f  Max %.1f", st.dist, avg, st.maxV), n > 1 and 1 or 0)
@@ -825,7 +1241,6 @@ local function hideMap()
     M.bg.Visible, M.border.Visible, M.title.Visible = false, false, false
     M.s.Visible, M.e.Visible, M.c.Visible = false, false, false
     for _, s in ipairs(D.mapSegs) do s.l.Visible = false end
-    for _, c in ipairs(D.mk) do c.c.Visible = false end
     S.mapShown, S.mapKey = false, nil
 end
 
@@ -888,15 +1303,6 @@ local function updateMap()
         if ex then
             M.e.Position, M.e.Visible = Vector2.new(mx + pad + ex * inner, my + pad + ez * inner), true
         end
-        for q, c in ipairs(D.mk) do
-            local x, z = toMap(c.p)
-            if x then
-                c.c.Position = Vector2.new(mx + pad + x * inner, my + pad + z * inner)
-                c.c.Color, c.c.Transparency, c.c.Visible = A.c, A.a, true
-            else
-                c.c.Visible = false
-            end
-        end
     end
     local cur = fr[math.max(1, math.min(S.play and S.pIdx or (S.ghost and S.gIdx or n), n))]
     local cx, cz = toMap(cur.p)
@@ -950,21 +1356,25 @@ local function rd(v)
     return math.floor(v * 100000 + 0.5) / 100000
 end
 
-local function save()
+local function saveFile(name)
     ensureFolder()
     local fr = D.frames
     local out = { rate = C.rate, frames = {} }
     for i = 1, #fr do
         local f = fr[i]
-        local p, l = f.cf.Position, f.cf.LookVector
-        out.frames[i] = { t = rd(f.t), p = { rd(p.X), rd(p.Y), rd(p.Z) }, l = { rd(l.X), rd(l.Y), rd(l.Z) } }
+        local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = f.cf:GetComponents()
+        out.frames[i] = {
+            t = rd(f.t),
+            p = { rd(px), rd(py), rd(pz) },
+            r = { rd(r00), rd(r01), rd(r02), rd(r10), rd(r11), rd(r12), rd(r20), rd(r21), rd(r22) },
+        }
     end
-    local ok = pcall(writefile, rpath(C.file), HttpService:JSONEncode(out))
+    local ok = pcall(writefile, rpath(name), HttpService:JSONEncode(out))
     if ok then refreshList() end
     return ok
 end
 
-local function load()
+local function loadFile()
     local path = rpath(C.file)
     if not isfile(path) then return false end
     local ok, raw = pcall(readfile, path)
@@ -975,11 +1385,14 @@ local function load()
     if S.ghost then setGhost(false) end
     local nf = {}
     for _, f in ipairs(data.frames) do
-        if type(f.p) == "table" then
-            local p = f.p
+        local p = f.p
+        if type(p) == "table" and type(p[1]) == "number" and type(p[2]) == "number" and type(p[3]) == "number" then
             local pos = Vector3.new(p[1], p[2], p[3])
             local cf
-            if type(f.l) == "table" then
+            local r = f.r
+            if type(r) == "table" and #r == 9 then
+                cf = CFrame.new(p[1], p[2], p[3], unpack(r))
+            elseif type(f.l) == "table" then
                 local lv = Vector3.new(f.l[1], f.l[2], f.l[3])
                 cf = lv.Magnitude > 0.001 and CFrame.lookAt(pos, pos + lv) or CFrame.new(p[1], p[2], p[3])
             else
@@ -991,69 +1404,41 @@ local function load()
     D.frames = nf
     D.marks = {}
     rebuildTrail()
-    rebuildMk()
+    rebuildMap()
     return true
 end
 
 local function applyTrim()
     local fr = D.frames
-    local n = #fr
-    if n < 3 then
+    if #fr < 3 then
         notify("Not enough frames", "Recorder", 2)
         return
     end
-    local tr = S.tr
-    if tr.h == 0 and tr.t == 0 and tr.hs == 0 and tr.ts == 0 then
-        notify("Set trim first", "Recorder", 2)
-        return
-    end
-    local hi, ti = 1, n
-    if tr.hs > 0 then
-        local cut = fr[1].t + tr.hs
-        while hi < n and fr[hi].t < cut do hi = hi + 1 end
-    end
-    if tr.ts > 0 then
-        local cut = fr[n].t - tr.ts
-        while ti > 1 and fr[ti].t > cut do ti = ti - 1 end
-    end
-    if tr.h > 0 then hi = math.min(hi + tr.h, n) end
-    if tr.t > 0 then ti = math.max(ti - tr.t, 1) end
-    if hi >= ti then
+    local hi, ti = computeTrimIndices()
+    if not hi then
         notify("Invalid trim", "Recorder", 2)
         return
     end
-    if hi == 1 and ti == n then
+    if hi == 1 and ti == #fr then
         notify("Nothing to trim", "Recorder", 2)
         return
     end
-
-    if S.play then setPlay(false) end
+    setPlay(false)
     if S.ghost then setGhost(false) end
-
-    local n0 = n
+    local n0 = #fr
     local off = fr[hi].t
+    local tEnd = fr[ti].t
     local nf = {}
-    for i = hi, ti do
-        nf[#nf + 1] = { t = fr[i].t - off, cf = fr[i].cf, p = fr[i].p }
+    for i = hi, ti do nf[#nf + 1] = { t = fr[i].t - off, cf = fr[i].cf, p = fr[i].p } end
+    local nmk = {}
+    for _, m in ipairs(D.marks) do
+        if m.t >= off and m.t <= tEnd then nmk[#nmk + 1] = { t = m.t - off, p = m.p } end
     end
     D.frames = nf
-    D.marks = {}
-    D.bounds = nil
-    S.tcKey = nil
-    S.tcH = nil
-    S.tcT = nil
-    S.mapKey = nil
-
+    D.marks = nmk
     rebuildTrail()
-    rebuildMk()
-
-    S.tr.h, S.tr.t, S.tr.hs, S.tr.ts = 0, 0, 0, 0
-    S.tcKey = nil
-    UI.SetValue("r_trim_h", 0)
-    UI.SetValue("r_trim_t", 0)
-    UI.SetValue("r_trim_hs", 0)
-    UI.SetValue("r_trim_ts", 0)
-
+    rebuildMap()
+    resetTrimValues()
     notify(string.format("Trim: %d -> %d", n0, #nf), "Recorder", 2)
 end
 
@@ -1093,9 +1478,23 @@ local function loadCfg()
     C.trimPreview = b(d.trimPreview, C.trimPreview)
     C.heat, C.liveTrail = b(d.heat, C.heat), b(d.liveTrail, C.liveTrail)
     C.smoothTrail = b(d.smoothTrail, C.smoothTrail)
+    C.fxOn = b(d.fxOn, C.fxOn)
+    C.fx = math.clamp(math.floor(n(d.fx, C.fx)), 0, #K.FXN - 1)
+    C.fxSpeed = math.clamp(n(d.fxSpeed, C.fxSpeed), 0.2, 4)
+    C.trailW = math.clamp(math.floor(n(d.trailW, C.trailW)), 1, 6)
+    C.pOn = b(d.pOn, C.pOn)
+    C.pType = math.clamp(math.floor(n(d.pType, C.pType)), 0, #K.PN - 1)
+    C.pCol = math.clamp(math.floor(n(d.pCol, C.pCol)), 0, #K.PCN - 1)
+    C.pRate = math.clamp(n(d.pRate, C.pRate), 5, 300)
+    C.pSize = math.clamp(n(d.pSize, C.pSize), 0.5, 6)
+    C.pLife = math.clamp(n(d.pLife, C.pLife), 0.3, 4)
+    C.pSpread = math.clamp(n(d.pSpread, C.pSpread), 0.2, 3)
+    C.pMax = math.clamp(math.floor(n(d.pMax, C.pMax)), 20, 500)
     C.ghostColor = readColor(d.ghostColor, C.ghostColor)
     C.accentColor = readColor(d.accentColor, C.accentColor)
     C.pathColor = readColor(d.pathColor, C.pathColor)
+    C.gradColor = readColor(d.gradColor, C.gradColor)
+    C.pColor = readColor(d.pColor, C.pColor)
     C.headColor = readColor(d.headColor, C.headColor)
     C.tailColor = readColor(d.tailColor, C.tailColor)
     C.trimColor = readColor(d.trimColor, C.trimColor)
@@ -1107,7 +1506,11 @@ local function syncUI()
     for _, kv in ipairs({
         {"r_rate", C.rate}, {"r_spd", C.pSpeed},
         {"r_path", C.showPath}, {"r_heat", C.heat}, {"r_smooth", C.smoothTrail},
-        {"r_live", C.liveTrail}, {"r_ghost", false},
+        {"r_live", C.liveTrail},
+        {"r_fx_on", C.fxOn}, {"r_fx", C.fx}, {"r_fx_spd", C.fxSpeed}, {"r_tw", C.trailW},
+        {"r_pt_on", C.pOn}, {"r_pt_type", C.pType}, {"r_pt_col", C.pCol},
+        {"r_pt_rate", C.pRate}, {"r_pt_size", C.pSize}, {"r_pt_life", C.pLife}, {"r_pt_spread", C.pSpread}, {"r_pt_max", C.pMax},
+        {"r_ghost", false}, {"r_scrub_on", false},
         {"r_hud", C.showHud}, {"r_graph", C.showGraph}, {"r_bar", C.showBar},
         {"r_hud_x", C.hudX}, {"r_hud_y", C.hudY}, {"r_hud_scale", C.hudScale}, {"r_hud_alpha", C.hudAlpha},
         {"r_hud_corner", C.hudCorner}, {"r_hud_font", C.hudFont},
@@ -1138,7 +1541,7 @@ end
 
 local function stopRec()
     rebuildTrail()
-    rebuildMk()
+    rebuildMap()
 end
 
 local function setRec(v)
@@ -1157,7 +1560,7 @@ local function setRec(v)
     end
 end
 
-local function setPlay(v)
+setPlay = function(v)
     if S.play == v then return end
     if v and S.rec then
         S.rec = false
@@ -1179,7 +1582,7 @@ local function setPlay(v)
         if S.ghost then setGhost(false) end
         S.pEl = 0
         S.pIdx = 1
-        local cf, idx = sampleCf(0)
+        local cf, idx = sampleCf(fr, S.pEl)
         S.pIdx = idx or 1
         if cf then
             h.CFrame = cf
@@ -1192,6 +1595,15 @@ local function setPlay(v)
     UI.SetValue("r_play_on", v)
 end
 
+local function tpTime(t)
+    local h = hrp()
+    local cf = sampleCf(D.frames, t)
+    if h and cf then
+        h.CFrame = cf
+        h.AssemblyLinearVelocity = Vector3.zero
+    end
+end
+
 local function fullReset()
     setPlay(false)
     setRec(false)
@@ -1202,6 +1614,7 @@ local function fullReset()
     st.dist, st.maxV, st.minV = 0, 0, math.huge
     clearTrail()
     clearMap()
+    clearParticles()
     for _, s in ipairs(D.graphSegs) do s.Visible = false end
     S.lastCf, S.lastCfT = nil, 0
     S.frameGaps, S.overflow, S.drawn, S.vtick, S.trimCV = 0, false, 0, 0, -1
@@ -1231,7 +1644,7 @@ local function stepPlay(dt)
             setPlay(false)
         end
     end
-    local cf, idx = sampleCf(S.pEl)
+    local cf, idx = sampleCf(fr, S.pEl)
     S.pIdx = idx or 1
     if cf then
         h.CFrame = cf
@@ -1247,15 +1660,19 @@ local function updateGhost(dt)
         return
     end
     local T = fr[n].t
-    S.gEl = S.gEl + dt * C.pSpeed
-    if S.gEl >= T then
-        S.gEl = T
-        setGhost(false)
-        return
+    if S.scrub then
+        S.gEl = math.clamp(S.scrubV / 1000, 0, 1) * T
+    else
+        S.gEl = S.gEl + dt * C.pSpeed
+        if S.gEl >= T then
+            S.gEl = T
+            setGhost(false)
+            return
+        end
     end
-    local cf, idx = sampleCf(S.gEl)
+    local cf, idx = sampleCf(fr, S.gEl)
     S.gIdx = idx or 1
-    if cf then showGhost(cf) else hideGhost() end
+    if cf then showGhost(DR.ghost, cf) else hideGhost(DR.ghost) end
 end
 
 local function keyDown(c)
@@ -1320,7 +1737,7 @@ RunService.Heartbeat:Connect(function()
         if n <= K.MAX_SEGS then
             local tr = D.trail
             local lastColor = #tr > 0 and tr[#tr].hc or nil
-            for i = S.drawn + 1, n do lastColor = addSeg(i, 1, lastColor, n) end
+            for i = S.drawn + 1, n do lastColor = addSeg(i, i - 1, lastColor) end
             S.drawn = n
         end
     end
@@ -1339,20 +1756,32 @@ RunService.RenderStepped:Connect(function()
     if dt > 0.1 then dt = 0.1 elseif dt < 0 then dt = 0 end
 
     if S.rcVer ~= S.colorVer then refreshColors() end
+    S.fxT = S.fxT + dt * C.fxSpeed
+    S.fxPh = math.floor(S.fxT * K.FXHZ) % K.FXCYC
 
-    if S.dTrail then S.dTrail = false rebuildTrail() rebuildMap() end
+    if S.dTrail then
+        S.dTrail = false
+        rebuildTrail()
+        rebuildMap()
+    end
 
     if S.play then stepPlay(dt) end
-    if S.ghost then updateGhost(dt) elseif S.gShown then hideGhost() end
+    if S.ghost then updateGhost(dt) elseif DR.ghost.shown then hideGhost(DR.ghost) end
+
+    S.pAcc = S.pAcc + dt
+    S.pv = S.pv + 1
+    if S.pv >= 1 then
+        updateParticles(S.pAcc)
+        S.pAcc, S.pv = 0, 0
+    end
 
     S.vtick = S.vtick + 1
-    if S.vtick >= 2 then
+    if S.vtick >= S.thr then
         S.vtick = 0
         S.phase = 1 - S.phase
         updatePath()
         updateTrimPreview()
-        updateHud()
-        updateMap()
+        if S.phase == 0 then updateHud() else updateMap() end
     end
 end)
 
@@ -1401,7 +1830,7 @@ UI.AddTab("Recorder", function(tab)
         end)
     end
     s2:Button("Save", 100, 20, function()
-        if save() then
+        if saveFile(C.file) then
             saveCfg()
             notify("Saved " .. C.file, "Recorder", 2)
         else
@@ -1409,7 +1838,7 @@ UI.AddTab("Recorder", function(tab)
         end
     end)
     s2:Button("Load", 100, 20, function()
-        if load() then notify("Loaded " .. #D.frames .. " frames", "Recorder", 2)
+        if loadFile() then notify("Loaded " .. #D.frames .. " frames", "Recorder", 2)
         else notify("Not found", "Recorder", 2) end
     end)
     s2:Button("Refresh List", 100, 20, function()
@@ -1429,6 +1858,7 @@ UI.AddTab("Recorder", function(tab)
     end)
     s3:Button("Load Config", 120, 20, function()
         if loadCfg() then
+            clearParticles()
             syncUI()
             S.dTrail = true
             notify("Config loaded", "Recorder", 2)
@@ -1446,13 +1876,19 @@ UI.AddTab("Recorder", function(tab)
         C.hudCorner, C.hudFont = 6, 5
         C.trimPreview, C.heat = true, false
         C.liveTrail, C.smoothTrail = false, true
+        C.fxOn, C.fx, C.fxSpeed, C.trailW = true, 1, 1.0, 2
+        C.pOn, C.pType, C.pCol = true, 0, 3
+        C.pRate, C.pSize, C.pLife, C.pSpread, C.pMax = 40, 2.0, 1.0, 1.0, 200
         C.ghostColor = {r = 255, g = 120, b = 255, a = 0.9}
         C.accentColor = {r = 120, g = 220, b = 180, a = 1}
         C.pathColor = {r = 120, g = 220, b = 180, a = 1}
+        C.gradColor = {r = 255, g = 80, b = 200, a = 1}
+        C.pColor = {r = 255, g = 200, b = 80, a = 1}
         C.headColor = {r = 255, g = 60, b = 60, a = 1}
         C.tailColor = {r = 60, g = 180, b = 255, a = 1}
         C.trimColor = {r = 255, g = 140, b = 40, a = 0.9}
         S.colorVer = S.colorVer + 1
+        clearParticles()
         resetTrimValues()
         syncUI()
         S.dTrail = true
@@ -1484,13 +1920,55 @@ UI.AddTab("Recorder", function(tab)
     s5:Toggle("r_heat", "Show Trail Speed", C.heat, function(v) C.heat = v S.colorVer = S.colorVer + 1 end)
     s5:Toggle("r_live", "Live Trail", C.liveTrail, function(v) C.liveTrail = v end)
     s5:Toggle("r_smooth", "Smooth Trail", C.smoothTrail, function(v) C.smoothTrail = v S.dTrail = true end)
-    s5:Toggle("r_ghost", "Ghost Preview [G]", false, function(v) setGhost(v) end)
-    s5:ColorPicker("r_ghost_col", C.ghostColor.r / 255, C.ghostColor.g / 255, C.ghostColor.b / 255, C.ghostColor.a, colorCb("ghostColor"))
     s5:Button("Rebuild", 120, 20, function() S.dTrail = true end)
     s5:Button("Clear Path", 120, 20, function()
         clearTrail()
         clearMap()
         D.bounds = nil
+    end)
+
+    local s10 = tab:Section("Trail FX", "Right")
+    s10:Toggle("r_fx_on", "Trail Effects", C.fxOn, function(v) C.fxOn = v S.colorVer = S.colorVer + 1 end)
+    s10:ColorPicker("r_grad_col", C.gradColor.r / 255, C.gradColor.g / 255, C.gradColor.b / 255, C.gradColor.a, colorCb("gradColor"))
+    s10:Combo("r_fx", "Effect", K.FXN, C.fx, function(i)
+        C.fx = i
+        S.colorVer = S.colorVer + 1
+    end)
+    s10:SliderFloat("r_fx_spd", "Effect Speed", 0.2, 4.0, C.fxSpeed, "%.2f", function(v) C.fxSpeed = v end)
+    s10:SliderInt("r_tw", "Trail Width", 1, 6, C.trailW, function(v) C.trailW = v S.colorVer = S.colorVer + 1 end)
+    s10:Tip("Gradient: Path color -> Effect color")
+
+    local s11 = tab:Section("Particles", "Right")
+    s11:Toggle("r_pt_on", "Particles", C.pOn, function(v)
+        C.pOn = v
+        if not v then clearParticles() end
+    end)
+    s11:ColorPicker("r_pt_pick", C.pColor.r / 255, C.pColor.g / 255, C.pColor.b / 255, C.pColor.a, colorCb("pColor"))
+    s11:Combo("r_pt_type", "Particle Type", K.PN, C.pType, function(i)
+        C.pType = i
+        clearParticles()
+    end)
+    s11:Combo("r_pt_col", "Particle Color", K.PCN, C.pCol, function(i)
+        C.pCol = i
+        S.colorVer = S.colorVer + 1
+    end)
+    s11:SliderInt("r_pt_rate", "Emit Rate", 5, 300, C.pRate, function(v) C.pRate = v end)
+    s11:SliderFloat("r_pt_size", "Particle Size", 0.5, 6.0, C.pSize, "%.1f", function(v) C.pSize = v end)
+    s11:SliderFloat("r_pt_life", "Lifetime", 0.3, 4.0, C.pLife, "%.2f", function(v) C.pLife = v end)
+    s11:SliderFloat("r_pt_spread", "Spread / Speed", 0.2, 3.0, C.pSpread, "%.2f", function(v) C.pSpread = v end)
+    s11:SliderInt("r_pt_max", "Max Particles", 20, 500, C.pMax, function(v) C.pMax = v end)
+    s11:Button("Clear Particles", 120, 20, function() clearParticles() end)
+
+    local s9 = tab:Section("Ghost", "Right")
+    s9:Toggle("r_ghost", "Ghost Preview [G]", false, function(v) setGhost(v) end)
+    s9:ColorPicker("r_ghost_col", C.ghostColor.r / 255, C.ghostColor.g / 255, C.ghostColor.b / 255, C.ghostColor.a, colorCb("ghostColor"))
+    s9:Toggle("r_scrub_on", "Scrub Mode", false, function(v) setScrub(v) end)
+    s9:SliderInt("r_scrub", "Scrub Timeline", 0, 1000, 0, function(v) S.scrubV = v end)
+    s9:Button("Teleport To Scrub", 140, 20, function()
+        local fr = D.frames
+        local n = #fr
+        if n < 2 then return end
+        tpTime(math.clamp(S.scrubV / 1000, 0, 1) * fr[n].t)
     end)
 
     local s6 = tab:Section("HUD", "Right")
