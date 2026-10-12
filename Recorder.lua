@@ -2214,8 +2214,8 @@ UI.AddTab("Recorder", function(tab)
         KBind.ghost = v
     end)
     KB.ghost = s9:Keybind("r_kb_ghost", 71, "hold")
-    s9:ColorPicker("r_ghost_col", C.ghostColor.r / 255, C.ghostColor.g / 255, C.ghostColor.b / 255, C.ghostColor.a, colorCb("ghostColor"))
     s9:Toggle("r_scrub_on", "Scrub Mode", false, function(v) setScrub(v) end)
+    s9:ColorPicker("r_ghost_col", C.ghostColor.r / 255, C.ghostColor.g / 255, C.ghostColor.b / 255, C.ghostColor.a, colorCb("ghostColor"))
     s9:SliderInt("r_scrub", "Scrub Timeline", 0, 1000, 0, function(v) S.scrubV = v end)
     s9:Button("Teleport To Scrub", 140, 20, function()
         local fr = D.frames
