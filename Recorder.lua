@@ -65,8 +65,9 @@ local K = {
     MAX_SEGS = 800, MIN_DIST = 0.1, MAX_FRAMES = 18000, LIVE_BATCH = 4,
     GRAPH_PTS = 60, HROWS = 6, POOL_CAP = 1200, CPOOL_CAP = 600,
     FOLDER = "recorder", CFG = "recorder_config.json",
-    FXN = {"Solid", "Comet", "Rainbow", "Pulse", "Fire", "Ice", "Gradient", "Dashed", "Neon", "Sparkle", "Speed Width"},
-    FXA = {[2] = true, [3] = true, [4] = true, [5] = true, [9] = true},
+    VK_R = 82, VK_P = 80, VK_L = 76, VK_G = 71,
+    FXN = {"Solid", "Comet", "Rainbow", "Pulse", "Fire", "Ice", "Gradient", "Dashed", "Neon", "Aurora", "Lava", "Chase", "Matrix"},
+    FXA = {[2] = true, [3] = true, [4] = true, [5] = true, [9] = true, [10] = true, [11] = true, [12] = true},
     FXHZ = 12, FXCYC = 36,
     PN = {"Embers", "Stardust", "Bubbles", "Snow"},
     PCN = {"Path", "Accent", "Rainbow", "Fire", "Ice", "White", "Gradient", "Custom"},
@@ -96,6 +97,12 @@ local K = {
     FY = Color3.fromRGB(255, 230, 80),
     IB = Color3.fromRGB(50, 130, 255),
     IW = Color3.fromRGB(210, 248, 255),
+    LV0 = Color3.fromRGB(90, 5, 0),
+    AU1 = Color3.fromRGB(60, 255, 160),
+    AU2 = Color3.fromRGB(60, 200, 255),
+    AU3 = Color3.fromRGB(170, 90, 255),
+    MX1 = Color3.fromRGB(0, 70, 20),
+    MX2 = Color3.fromRGB(60, 255, 100),
 }
 
 for i = 0, 7 do
@@ -412,12 +419,21 @@ local function fxApply(fx, i, nT, e, c, a, ph)
     elseif fx == 8 then
         return mixC(c, K.WHITE, 0.45), a, 0
     elseif fx == 9 then
-        if (i * 7919 + ph * 104729) % 101 < 5 then return K.WHITE, 1, 1 end
-        return c, a, 0
+        local k = 0.5 + 0.5 * math.sin(6.2832 * (t * 2.2 - p))
+        local k2 = 0.5 + 0.5 * math.sin(6.2832 * (t * 1.1 + p * 2))
+        return mixC(mixC(K.AU1, K.AU2, k), K.AU3, k2 * 0.8), a * (0.6 + 0.4 * k2), 0
     elseif fx == 10 then
-        local mx = D.stat.maxV
-        if mx < 1 then mx = 1 end
-        return c, a, math.floor((D.spd[e.i] or 0) / mx * 3 + 0.5)
+        local v = (0.5 + 0.5 * math.sin(6.2832 * (t * 3 - p * 2))) * 0.65 + (0.5 + 0.5 * math.sin(6.2832 * (t * 7.3 - p * 3 + 0.3))) * 0.35
+        local col
+        if v < 0.5 then col = mixC(K.LV0, K.FR, v * 2) else col = mixC(K.FR, K.FY, (v - 0.5) * 2) end
+        return col, a * (0.6 + 0.4 * v), v > 0.75 and 1 or 0
+    elseif fx == 11 then
+        if (i - ph) % 12 < 4 then return mixC(c, K.WHITE, 0.7), a, 1 end
+        return c, a * 0.4, 0
+    elseif fx == 12 then
+        local q = (t * 6 - p * 6) % 1
+        if q < 0.05 then return K.WHITE, a, 1 end
+        return mixC(K.MX2, K.MX1, q), a * (1.05 - q * 0.7), 0
     end
     return c, a, 0
 end
