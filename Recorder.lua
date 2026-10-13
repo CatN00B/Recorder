@@ -1322,10 +1322,10 @@ local function updateHud()
     elseif S.ghost then idx = math.min(S.gIdx, n)
     else idx = n end
     local dur = n >= 2 and fr[n].t - fr[1].t or 0
-    local recTxt = "[R] Recording"
-    if S.rec then recTxt = string.format("[R] Recording  %.1fs", tick() - S.t0) end
+    local recTxt = "Recording"
+    if S.rec then recTxt = string.format("Recording  %.1fs", tick() - S.t0) end
     setRow(1, recTxt, S.rec and 1 or 0)
-    local pTxt = "[P] Playing"
+    local pTxt = "Playing"
     if S.play then pTxt = pTxt .. "  >>" end
     setRow(2, pTxt, S.play and 1 or 0)
     setRow(3, string.format("Loop %s  Ghost %s  FX %s", S.loop_ and "on" or "off", S.ghost and (S.scrub and "scrub" or "on") or "off", C.fxOn and K.FXN[C.fx + 1] or "off"), (S.loop_ or S.ghost) and 1 or 0)
