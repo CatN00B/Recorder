@@ -39,12 +39,17 @@ local S = {
     tr = {h = 0, t = 0, hs = 0, ts = 0},
     tcKey = nil, tcH = nil, tcT = nil,
     fileCombo = nil,
+    targetCombo = nil,
     lastCf = nil,
     scrubV = 0,
+    recTargetName = nil,
+    targetNames = {},
+    prevTargetList = "",
 }
 
 local C = {
     rate = 20, pSpeed = 1.0, file = "movement_rec",
+    target = "Me",
     showPath = true, showHud = true, showGraph = true, showBar = true, showMap = false,
     mapSize = 180, mapX = 0, mapY = 0, mapAlpha = 0.55,
     hudX = 20, hudY = 20, hudScale = 1.0, hudAlpha = 0.5, hudCorner = 6, hudFont = 5,
@@ -132,6 +137,55 @@ local function kbHeld(kb)
     if not kb then return false end
     local ok, v = pcall(function() return kb:IsEnabled() end)
     return ok and v == true
+end
+
+local function getPlayerByName(name)
+    if not name or name == "" or name == "Me" then return LP end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name == name then return p end
+    end
+    return nil
+end
+
+local function hrpOf(plr)
+    if not plr then return nil end
+    local c = plr.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function recHRP()
+    local plr = getPlayerByName(S.recTargetName)
+    return hrpOf(plr)
+end
+
+local function selfHRP()
+    return hrpOf(LP)
+end
+
+local function refreshTargetList()
+    local names = {"Me"}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then names[#names + 1] = p.Name end
+    end
+    table.sort(names, function(a, b)
+        if a == "Me" then return true end
+        if b == "Me" then return false end
+        return a:lower() < b:lower()
+    end)
+    local sig = table.concat(names, ",")
+    if sig == S.prevTargetList then return end
+    S.prevTargetList = sig
+    S.targetNames = names
+    local tc = S.targetCombo
+    if tc then
+        tc:Clear()
+        for _, n in ipairs(names) do tc:Add(n) end
+        local idx = 0
+        for i, n in ipairs(names) do
+            if n == C.target then idx = i - 1 break end
+        end
+        UI.SetValue("r_target_combo", idx)
+    end
 end
 
 local function refreshColors()
@@ -446,11 +500,6 @@ local function catmullRomV3(a, b, c, d, t)
         0.5 * ((2 * b.Y) + (-a.Y + c.Y) * t + (2 * a.Y - 5 * b.Y + 4 * c.Y - d.Y) * t2 + (-a.Y + 3 * b.Y - 3 * c.Y + d.Y) * t3),
         0.5 * ((2 * b.Z) + (-a.Z + c.Z) * t + (2 * a.Z - 5 * b.Z + 4 * c.Z - d.Z) * t2 + (-a.Z + 3 * b.Z - 3 * c.Z + d.Z) * t3)
     )
-end
-
-local function hrp()
-    local c = LP.Character
-    return c and c:FindFirstChild("HumanoidRootPart")
 end
 
 local function ensureFolder()
@@ -1060,8 +1109,14 @@ local function emitOne(x, y, z, bx, by, bz, sm)
 end
 
 local function headPos()
-    if S.play or S.rec then
-        local h = hrp()
+    if S.rec then
+        local h = recHRP()
+        if h then
+            local p = h.Position
+            return p.X, p.Y, p.Z
+        end
+    elseif S.play then
+        local h = selfHRP()
         if h then
             local p = h.Position
             return p.X, p.Y, p.Z
@@ -1323,7 +1378,10 @@ local function updateHud()
     else idx = n end
     local dur = n >= 2 and fr[n].t - fr[1].t or 0
     local recTxt = "Recording"
-    if S.rec then recTxt = string.format("Recording  %.1fs", tick() - S.t0) end
+    if S.rec then
+        local tgt = S.recTargetName or "Me"
+        recTxt = string.format("Recording %s  %.1fs", tgt, tick() - S.t0)
+    end
     setRow(1, recTxt, S.rec and 1 or 0)
     local pTxt = "Playing"
     if S.play then pTxt = pTxt .. "  >>" end
@@ -1547,7 +1605,7 @@ end
 local function saveFile(name)
     ensureFolder()
     local fr = D.frames
-    local out = { rate = C.rate, frames = {} }
+    local out = { rate = C.rate, frames = {}, src = S.recTargetName or "Me" }
     for i = 1, #fr do
         local f = fr[i]
         local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = f.cf:GetComponents()
@@ -1656,6 +1714,7 @@ local function loadCfg()
     C.rate = n(d.rate, C.rate)
     C.pSpeed = n(d.pSpeed, C.pSpeed)
     C.file = s(d.file, C.file)
+    C.target = s(d.target, C.target)
     C.showPath = b(d.showPath, C.showPath)
     C.showHud = b(d.showHud, C.showHud)
     C.showGraph = b(d.showGraph, C.showGraph)
@@ -1720,11 +1779,17 @@ local function syncUI()
         if nm == C.file then idx = i - 1 break end
     end
     UI.SetValue("r_file_combo", idx)
+    local tIdx = 0
+    for i, nm in ipairs(S.targetNames) do
+        if nm == C.target then tIdx = i - 1 break end
+    end
+    UI.SetValue("r_target_combo", tIdx)
 end
 
 local function startRec()
     S.play = false
     if S.ghost then setGhost(false) end
+    S.recTargetName = C.target or "Me"
     D.frames = {}
     D.spd = {}
     D.spdS = {}
@@ -1736,6 +1801,7 @@ local function startRec()
     st.minV = math.huge
     clearTrail()
     clearMap()
+    PS.hv = false
     S.t0 = tick()
     S.lastCf = nil
     S.lastCfT = 0
@@ -1751,6 +1817,19 @@ end
 
 local function setRec(v)
     if S.rec == v then return end
+    if v then
+        local tgt = getPlayerByName(C.target)
+        if not tgt then
+            notify("Target not found", "Recorder", 2)
+            UI.SetValue("r_on", false)
+            return
+        end
+        if not hrpOf(tgt) then
+            notify("Target has no character", "Recorder", 2)
+            UI.SetValue("r_on", false)
+            return
+        end
+    end
     if v and S.play then
         S.play = false
         UI.SetValue("r_play_on", false)
@@ -1779,7 +1858,7 @@ setPlay = function(v)
             UI.SetValue("r_play_on", false)
             return
         end
-        local h = hrp()
+        local h = selfHRP()
         if not h then
             UI.SetValue("r_play_on", false)
             return
@@ -1787,6 +1866,7 @@ setPlay = function(v)
         if S.ghost then setGhost(false) end
         S.pEl = 0
         S.pIdx = 1
+        PS.hv = false
         local cf, idx = sampleCf(fr, S.pEl)
         S.pIdx = idx or 1
         if cf then
@@ -1801,7 +1881,7 @@ setPlay = function(v)
 end
 
 local function tpTime(t)
-    local h = hrp()
+    local h = selfHRP()
     local cf = sampleCf(D.frames, t)
     if h and cf then
         h.CFrame = cf
@@ -1842,12 +1922,13 @@ local function fullReset()
     S.mapShown = false
     S.trimShown = false
     S.tcKey = nil
+    S.recTargetName = nil
     resetTrimValues()
     notify("Recorder reset", "Recorder", 2)
 end
 
 local function stepPlay(dt)
-    local h = hrp()
+    local h = selfHRP()
     local fr = D.frames
     local n = #fr
     if not h or n < 2 then
@@ -1929,9 +2010,16 @@ task.spawn(function()
     end
 end)
 
+task.spawn(function()
+    while true do
+        refreshTargetList()
+        wait(0.5)
+    end
+end)
+
 RunService.Heartbeat:Connect(function()
     if not S.rec or S.play then return end
-    local h = hrp()
+    local h = recHRP()
     if not h then return end
     local now = tick()
     local interval = 1 / C.rate
@@ -2029,6 +2117,7 @@ ensureFolder()
 local cfgOk = loadCfg()
 refreshColors()
 refreshList()
+refreshTargetList()
 
 UI.AddTab("Recorder", function(tab)
     local s1 = tab:Section("Recorder", "Left")
@@ -2050,6 +2139,21 @@ UI.AddTab("Recorder", function(tab)
     s1:SliderInt("r_rate", "Sample Rate", 5, 60, C.rate, function(v) C.rate = v end)
     s1:SliderFloat("r_spd", "Playback Speed", 0.1, 5.0, C.pSpeed, "%.2f", function(v) C.pSpeed = v end)
     s1:Button("Reset", 100, 20, function() fullReset() end)
+
+    local sT = tab:Section("Target", "Left")
+    if not S.targetCombo then
+        S.targetCombo = sT:Combo("r_target_combo", "Record From", S.targetNames or {"Me"}, 0, function(i)
+            local nm = S.targetNames[i + 1]
+            if nm then C.target = nm end
+        end)
+    end
+    sT:Button("Refresh Targets", 120, 20, function()
+        S.prevTargetList = ""
+        refreshTargetList()
+        local cnt = #(S.targetNames or {})
+        notify("Targets: " .. tostring(cnt), "Recorder", 2)
+    end)
+    sT:Tip("Record from another player, playback always on Me")
 
     local s2 = tab:Section("Files", "Left")
     s2:InputText("r_name", "Name", C.file, function(t)
@@ -2113,6 +2217,7 @@ UI.AddTab("Recorder", function(tab)
     s3:Button("Reset Config", 120, 20, function()
         C.rate = 20
         C.pSpeed = 1.0
+        C.target = "Me"
         C.showPath = true
         C.showHud = true
         C.showGraph = true
